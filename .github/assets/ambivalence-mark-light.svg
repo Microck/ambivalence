@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- ambivalence mark: a single-storey lowercase a whose bowl is a lens with an off-centre pupil.
+       24-unit grid. Bowl: ring centred (11,12), outer r 8, inner r 4.8 (stroke 3.2).
+       Stem: 3.2 wide, x 17.8-21, full bowl height. Pupil: r 1.7 at (12.3,10.6), up and right.
+       Non-zero fill: outer, stem and pupil run clockwise, the bowl's hole counter-clockwise. -->
+  <path fill="#000000" d="M3 12A8 8 0 1 1 19 12A8 8 0 1 1 3 12Z M6.2 12A4.8 4.8 0 1 0 15.8 12A4.8 4.8 0 1 0 6.2 12Z M17.8 4H21V20H17.8Z M10.6 10.6A1.7 1.7 0 1 1 14 10.6A1.7 1.7 0 1 1 10.6 10.6Z"/>
+</svg>

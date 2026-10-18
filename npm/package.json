@@ -1,0 +1,15 @@
+{
+  "name": "ambivalence",
+  "version": "0.1.0",
+  "description": "give your coding agent a camera: your phone. pair once over mcp or cli, found on your wi-fi, end-to-end encrypted",
+  "license": "MIT",
+  "homepage": "https://github.com/Microck/ambivalence",
+  "repository": { "type": "git", "url": "git+https://github.com/Microck/ambivalence.git" },
+  "keywords": ["mcp", "model-context-protocol", "ai-agents", "camera", "phone", "cli"],
+  "bin": { "ambivalence": "cli.cjs" },
+  "scripts": { "postinstall": "node install.cjs" },
+  "files": ["cli.cjs", "install.cjs"],
+  "engines": { "node": ">=18" },
+  "os": ["linux", "darwin", "win32"],
+  "cpu": ["x64", "arm64"]
+}

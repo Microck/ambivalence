@@ -1,22 +1,26 @@
 <p align="center">
-  <img src=".github/assets/ambivalence-logo.png" width="720" alt="ambivalence logo">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/ambivalence-mark-dark.svg">
+    <img src=".github/assets/ambivalence-mark-light.svg" width="160" alt="ambivalence logo">
+  </picture>
 </p>
 
 <p align="center">
   <a href="https://github.com/Microck/ambivalence/releases"><img src="https://img.shields.io/github/v/release/Microck/ambivalence?display_name=tag&style=flat-square&label=release&color=000000" alt="release badge"></a>
+  <a href="https://www.npmjs.com/package/ambivalence"><img src="https://img.shields.io/npm/v/ambivalence?style=flat-square&label=npm&color=000000" alt="npm badge"></a>
   <a href="https://github.com/Microck/ambivalence/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Microck/ambivalence/ci.yml?branch=main&style=flat-square&label=ci&color=000000" alt="ci badge"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-mit-000000?style=flat-square" alt="license badge"></a>
 </p>
 
 <p align="center">
-  <img src=".github/assets/demo.gif" width="720" alt="pairing a phone once, then the agent capturing a photo">
+  <img src=".github/assets/demo.gif" width="720" alt="the agent checks an arduino through the phone camera, zooms in and answers">
 </p>
 
 ---
 
 `ambivalence` gives your coding agent a camera: your phone. pair the phone once, and from then on the agent takes photos, switches cameras, zooms and turns on the torch over MCP or the cli, with nothing to do on the phone. the phone and the agent find each other on your wi-fi, and everything between them is end-to-end encrypted.
 
-[protocol](docs/protocol.md) | [releases](https://github.com/Microck/ambivalence/releases) | [demo video](.github/assets/demo.mp4) | [ios build notes](apps/ios/README.md)
+[protocol](docs/protocol.md) | [npm](https://www.npmjs.com/package/ambivalence) | [releases](https://github.com/Microck/ambivalence/releases) | [demo video](.github/assets/demo.mp4) | [ios build notes](apps/ios/README.md)
 
 ## why
 
@@ -28,7 +32,14 @@ it is built to be left alone. you pair once with a 6-character code and a confir
 
 ### install
 
-download the binary for your platform from the [latest release](https://github.com/Microck/ambivalence/releases/latest):
+with npm (downloads the release binary for your platform and checks its checksum):
+
+```bash
+npm install -g ambivalence
+ambivalence version
+```
+
+or download the binary for your platform from the [latest release](https://github.com/Microck/ambivalence/releases/latest):
 
 ```bash
 # linux / macos (pick linux-amd64, linux-arm64, darwin-amd64 or darwin-arm64)
