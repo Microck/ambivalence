@@ -1,11 +1,15 @@
 #!/usr/bin/env node
-// Runs the binary install.cjs downloaded, passing arguments, stdio and exit code through.
-const path = require("path");
+// Runs the platform binary, fetching it first if postinstall did not run (ignore-scripts).
+const fs = require("fs");
 const { spawnSync } = require("child_process");
-const bin = path.join(__dirname, "bin", process.platform === "win32" ? "ambivalence.exe" : "ambivalence");
-const r = spawnSync(bin, process.argv.slice(2), { stdio: "inherit" });
-if (r.error) {
-  console.error("ambivalence: binary missing, reinstall the package (" + r.error.message + ")");
+const { install, dest } = require("./install.cjs");
+
+(async () => {
+  if (!fs.existsSync(dest)) await install();
+  const r = spawnSync(dest, process.argv.slice(2), { stdio: "inherit" });
+  if (r.error) throw r.error;
+  process.exit(r.status === null ? 1 : r.status);
+})().catch((e) => {
+  console.error("ambivalence: " + e.message);
   process.exit(1);
-}
-process.exit(r.status === null ? 1 : r.status);
+});
