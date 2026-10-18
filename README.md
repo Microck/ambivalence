@@ -65,7 +65,7 @@ sha256sum --check --ignore-missing checksums.txt
 
 - **android:** install `ambivalence.apk` from the release.
 - **ios:** the release has `ambivalence-unsigned.ipa`; sign it with your own team to sideload (see [apps/ios/README.md](apps/ios/README.md)).
-- **no app:** run the hub with `--tunnel` and open the printed https url in the phone browser.
+- **no app:** use the phone browser, see [from a browser](#from-a-browser).
 
 ### connect your agent
 
@@ -97,6 +97,18 @@ ambivalence hub &                 # the mcp server runs this for you
 ambivalence pair K9RBCY           # once per phone
 ambivalence capture -o shot.jpg   # any time after
 ```
+
+### from a browser
+
+the hub serves a camera page at `/`, so any phone with a browser works without installing anything. browsers only give the camera to https pages, so expose the hub over https:
+
+```bash
+ambivalence hub --tunnel   # needs cloudflared on PATH
+```
+
+it prints a `https://….trycloudflare.com` url and a qr code. open it on the phone, allow the camera, and pair with the code it shows like the apps. if you already serve the hub behind your own https proxy, pass `--public https://your.host` instead to get the qr code.
+
+the browser page can't find hubs on the wi-fi and stops when the tab closes; it reconnects by itself after network drops while open. it also trusts the hub that serves it (see [where the link key lives](#where-the-link-key-lives)).
 
 ## how it works
 
