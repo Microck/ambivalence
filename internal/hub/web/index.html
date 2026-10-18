@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#000000">
+<link rel="icon" href="mark.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<title>ambivalence</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #000; color: #fff; font: 15px/1.35 system-ui, -apple-system, sans-serif; }
+  #stage { position: relative; height: 100%; overflow: hidden; }
+  video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #000; }
+  canvas { display: none; }
+  .bar { position: absolute; left: 0; right: 0; padding: 16px 20px; background: rgba(0,0,0,.6); }
+  #top { top: 0; padding-top: max(16px, env(safe-area-inset-top)); }
+  #bot { bottom: 0; padding-bottom: max(20px, env(safe-area-inset-bottom)); }
+  .brand { display: flex; gap: 8px; align-items: center; font-weight: 700; margin-bottom: 8px; }
+  .brand svg { width: 22px; height: 22px; }
+  #code { font: 700 44px/1.1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .15em; user-select: all; }
+  #hint { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  input, button { font: inherit; color: #fff; background: #000; border: 1px solid #fff; border-radius: 6px; height: 48px; }
+  input { width: 100%; padding: 0 12px; font-size: 14px; }
+  input::placeholder { color: #fff; }
+  .row { display: flex; gap: 12px; margin-top: 12px; }
+  .row button { flex: 1; }
+  button:active { background: #fff; color: #000; }
+  #confirm { position: absolute; inset: 0; background: #000; padding: 32px 20px; display: flex; flex-direction: column; gap: 12px; justify-content: center; }
+  #confirm[hidden] { display: none; }
+  #sas { font: 700 44px/1.1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .15em; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" playsinline autoplay muted></video>
+  <canvas id="canvas"></canvas>
+  <div class="bar" id="top">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#fff" d="M3 12A8 8 0 1 1 19 12A8 8 0 1 1 3 12Z M6.2 12A4.8 4.8 0 1 0 15.8 12A4.8 4.8 0 1 0 6.2 12Z M17.8 4H21V20H17.8Z M10.6 10.6A1.7 1.7 0 1 1 14 10.6A1.7 1.7 0 1 1 10.6 10.6Z"/></svg>
+      ambivalence
+    </div>
+    <div id="status">starting camera</div>
+    <div id="code">------</div>
+    <div id="hint"></div>
+  </div>
+  <div id="confirm" hidden>
+    <div>pair with this agent?</div>
+    <div>check it shows the same code</div>
+    <div id="sas">------</div>
+    <div class="row"><button id="sas-cancel" type="button">cancel</button><button id="sas-ok" type="button">confirm</button></div>
+  </div>
+  <div class="bar" id="bot">
+    <input id="hub" type="url" inputmode="url" enterkeyhint="go" spellcheck="false" autocapitalize="off" placeholder="hub URL, e.g. wss://….trycloudflare.com/v1">
+    <div class="row">
+      <button id="connect" type="button">connect</button>
+      <button id="flip" type="button">flip</button>
+      <button id="torch" type="button">torch off</button>
+    </div>
+  </div>
+</div>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const video = $("video"), canvas = $("canvas"), hubEl = $("hub"), torchBtn = $("torch");
+  // Identity and link (see internal/link): device is a public id; key is the link key from the
+  // one-time pairing and never leaves this browser. Hubs only relay.
+  const enc = new TextEncoder();
+  const toHex = (u8) => Array.from(u8, b => b.toString(16).padStart(2, "0")).join("");
+  const fromHex = (s) => new Uint8Array((s || "").match(/../g)?.map(h => parseInt(h, 16)) || []);
+  const rand = (n) => crypto.getRandomValues(new Uint8Array(n));
+  const ident = JSON.parse(localStorage.getItem("ambivalence.identity") || "null") || { device: toHex(rand(16)), key: "" };
+  const saveIdent = () => localStorage.setItem("ambivalence.identity", JSON.stringify({ device: ident.device, key: ident.key }));
+  saveIdent();
+
+  async function H(label, ...fields) {
+    const parts = [enc.encode("ambivalence-v1/" + label)];
+    for (const f of fields) { const n = new Uint8Array(4); new DataView(n.buffer).setUint32(0, f.length); parts.push(n, f); }
+    const all = new Uint8Array(parts.reduce((s, p) => s + p.length, 0));
+    let o = 0; for (const p of parts) { all.set(p, o); o += p.length; }
+    return new Uint8Array(await crypto.subtle.digest("SHA-256", all));
+  }
+  async function MAC(key, label, ...fields) {
+    const k = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    return new Uint8Array(await crypto.subtle.sign("HMAC", k, await H(label, ...fields)));
+  }
+  const same = (a, b) => a.length === b.length && a.reduce((d, x, i) => d | (x ^ b[i]), 0) === 0;
+  async function SAS(aPub, pPub, nA, nB) {
+    const d = await H("sas", aPub, pPub, nA, nB);
+    const v = ((d[0] << 24) | (d[1] << 16) | (d[2] << 8) | d[3]) >>> 0;
+    const abc = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+    let s = ""; for (let i = 0; i < 6; i++) s += abc[(v >>> (27 - 5 * i)) & 31];
+    return s;
+  }
+  // Ask the user to compare codes; resolves true on Confirm, false on Cancel. cancelConfirm
+  // resolves "gone" when the agent leaves or the socket drops, so a late tap can never store a
+  // key the agent lacks.
+  let cancelConfirm = () => {};
+  const askConfirm = (sas) => new Promise((ok) => {
+    const done = (v) => { $("confirm").hidden = true; cancelConfirm = () => {}; ok(v); };
+    cancelConfirm = () => done("gone");
+    $("sas").textContent = sas; $("confirm").hidden = false;
+    $("sas-ok").onclick = () => done(true);
+    $("sas-cancel").onclick = () => done(false);
+  });
+
+  // Sealed channel (link.Channel): AES-256-GCM, box = seq (8 bytes BE) || ciphertext, nonce
+  // 4 zero bytes || seq, seq as additional data, and each box must be exactly the next seq.
+  const seqBytes = (n) => { const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, n); return b; };
+  const gcm = (sb) => { const iv = new Uint8Array(12); iv.set(sb, 4); return { name: "AES-GCM", iv, additionalData: sb }; };
+  async function makeSeal(key, nP, nA) {
+    const sk = await H("session", key, enc.encode(ident.device), nP, nA);
+    const imp = async (label) => crypto.subtle.importKey("raw", await H(label, sk), "AES-GCM", false, ["encrypt", "decrypt"]);
+    return { tx: { k: await imp("seal-phone"), seq: 0n }, rx: { k: await imp("seal-agent"), seq: 0n } };
+  }
+  async function sealBox(ch, plain) {
+    const sb = seqBytes(++ch.seq);
+    const ct = new Uint8Array(await crypto.subtle.encrypt(gcm(sb), ch.k, plain));
+    const box = new Uint8Array(8 + ct.length); box.set(sb); box.set(ct, 8);
+    return box;
+  }
+  async function openBox(ch, box) {
+    if (box.length < 24) throw new Error("sealed message too short");
+    const sb = box.subarray(0, 8), seq = new DataView(box.buffer, box.byteOffset).getBigUint64(0);
+    if (seq !== ch.seq + 1n) throw new Error("sealed message out of order");
+    const plain = new Uint8Array(await crypto.subtle.decrypt(gcm(sb), ch.k, box.subarray(8)));
+    ch.seq = seq;
+    return plain;
+  }
+  const b64 = (u8) => btoa(String.fromCharCode(...u8));
+  const unb64 = (s) => Uint8Array.from(atob(s || ""), c => c.charCodeAt(0));
+
+  let code = "------";
+  let ws, stream, facing = "environment", torchOn = false, zoomLevel = 1;
+  // Per-agent state, reset when an agent arrives or leaves. seal is set once the agent proved
+  // the link; only requests sealed under it may touch the camera.
+  let agentHere = false, seal = null, challenge = null, pairing = null, squatTimer = null;
+  // Sealed sends run one at a time so wire order equals sequence order.
+  let outbox = Promise.resolve();
+
+  const setStatus = (s) => { $("status").textContent = s; };
+  // Once linked the agent finds this phone by itself; the code stays visible for re-pairing.
+  const showCode = (c) => {
+    code = c;
+    $("code").textContent = c;
+    $("hint").textContent = ident.key ? "linked: just ask your agent to use the camera" : c === "------" ? "" : "first time only, on the agent: ambivalence pair " + c;
+  };
+  const setTorch = (on) => { torchOn = on; torchBtn.textContent = on ? "torch on" : "torch off"; };
+  showCode(code);
+  hubEl.value = new URLSearchParams(location.search).get("hub") ||
+    (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/v1";
+
+  async function startCamera() {
+    // Browsers expose the camera only on HTTPS (or localhost). Say so instead of failing silently.
+    if (!navigator.mediaDevices || !window.isSecureContext) {
+      throw new Error("the camera needs HTTPS. Open the https:// tunnel URL printed by `ambivalence hub --tunnel`");
+    }
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false, video: { facingMode: { ideal: facing }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+    });
+    video.srcObject = stream;
+    setTorch(false);
+    zoomLevel = 1; // a new stream starts unzoomed
+  }
+
+  async function applyTorch(on) {
+    const track = stream && stream.getVideoTracks()[0];
+    const caps = track && track.getCapabilities ? track.getCapabilities() : {};
+    if (!caps.torch) throw new Error("this camera has no torch");
+    await track.applyConstraints({ advanced: [{ torch: on }] });
+    setTorch(on);
+  }
+
+  // Zoom uses the camera's own zoom constraint where the browser exposes it (Chrome on Android).
+  const zoomRange = () => {
+    const track = stream && stream.getVideoTracks()[0];
+    const z = track && track.getCapabilities ? track.getCapabilities().zoom : null;
+    return z ? { min: z.min, max: z.max } : { min: 1, max: 1 };
+  };
+  async function applyZoom(level) {
+    const { min, max } = zoomRange();
+    if (level < min || level > max) throw new Error(`zoom ${level} out of range ${min}-${max}`);
+    if (max > min) await stream.getVideoTracks()[0].applyConstraints({ advanced: [{ zoom: level }] });
+    zoomLevel = level;
+  }
+
+  function captureJpeg(quality, maxWidth) {
+    let w = video.videoWidth, h = video.videoHeight;
+    if (!w) return Promise.reject(new Error("camera not ready"));
+    const scale = Math.min(1, (maxWidth || 1280) / Math.max(w, h));
+    w = Math.round(w * scale); h = Math.round(h * scale);
+    canvas.width = w; canvas.height = h;
+    canvas.getContext("2d").drawImage(video, 0, 0, w, h);
+    return new Promise((ok, fail) => canvas.toBlob(b => b ? ok({ b, w, h }) : fail(new Error("jpeg encode failed")), "image/jpeg", (quality || 80) / 100));
+  }
+
+  const send = (o) => { o.v = 1; ws.send(JSON.stringify(o)); };
+  const side = () => facing === "user" ? "front" : "back";
+  const state = (id, type) => ({ type, id, facing: side(), cameraId: side(), torch: torchOn, zoom: zoomLevel, connected: true });
+
+  // Replies to a sealed request go back sealed; a frame's JPEG follows as its own sealed box.
+  function sendSealed(s, obj, buf) {
+    obj.v = 1;
+    outbox = outbox.then(async () => {
+      ws.send(JSON.stringify({ v: 1, type: "sealed", id: obj.id, box: b64(await sealBox(s.tx, enc.encode(JSON.stringify(obj)))) }));
+      if (buf) ws.send(await sealBox(s.tx, new Uint8Array(buf)));
+    }).catch(() => {});
+  }
+
+  async function onMessage(ev) {
+    if (typeof ev.data !== "string") return;
+    const m = JSON.parse(ev.data);
+    try {
+      switch (m.type) {
+        case "welcome": showCode(m.code || code); // fall through
+        case "status": return onPresence(!!m.connected);
+        case "ping": return send({ type: "pong", id: m.id });
+        case "auth": {
+          const key = fromHex(ident.key), nP = fromHex(m.nonce), nA = fromHex(m.agentNonce), dev = enc.encode(ident.device);
+          if (!ident.key || !challenge || nA.length !== 16 || !same(nP, challenge) || !same(fromHex(m.mac), await MAC(key, "agent", dev, nP, nA))) return reject();
+          seal = await makeSeal(key, nP, nA); challenge = null; clearTimeout(squatTimer);
+          setStatus("paired, agent can see this camera");
+          return send({ type: "authok", nonce: m.nonce, mac: toHex(await MAC(key, "phone", dev, nP, nA)) });
+        }
+        case "pair1": {
+          const kp = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+          const pub = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+          pairing = { kp, pub, nB: rand(16), commit: fromHex(m.commit) };
+          return send({ type: "pair2", id: m.id, pub: toHex(pub), nonce: toHex(pairing.nB), device: ident.device });
+        }
+        case "pair3": {
+          const p = pairing, aPub = fromHex(m.pub), nA = fromHex(m.nonce);
+          if (!p || nA.length !== 16 || !same(p.commit, await H("commit", aPub, nA))) { send({ type: "error", id: m.id, error: "pairing commitment mismatch" }); return reject(); }
+          const peer = await crypto.subtle.importKey("raw", aPub, { name: "ECDH", namedCurve: "P-256" }, false, []);
+          const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: peer }, p.kp.privateKey, 256));
+          const answer = await askConfirm(await SAS(aPub, p.pub, nA, p.nB));
+          // The agent already left: no error or reject, which could drop a newer agent whose
+          // arrival is still queued behind this handler.
+          if (answer === "gone") { pairing = null; return; }
+          if (!answer) { send({ type: "error", id: m.id, error: "pairing cancelled on the phone" }); return reject(); }
+          const key = await H("key", shared, aPub, p.pub);
+          ident.key = toHex(key); saveIdent(); showCode(code);
+          seal = await makeSeal(key, p.nB, nA); pairing = null; clearTimeout(squatTimer);
+          setStatus("paired, agent can see this camera");
+          return send({ type: "pair4", id: m.id, mac: toHex(await MAC(key, "confirm", enc.encode(ident.device))) });
+        }
+        case "sealed": {
+          if (!seal) return send({ type: "error", id: m.id, error: "agent not authenticated" });
+          const s = seal;
+          let inner;
+          try { inner = JSON.parse(new TextDecoder().decode(await openBox(s.rx, unb64(m.box)))); } catch { return; } // forged or replayed by the hub
+          if (inner.id !== m.id) return;
+          try { await camera(s, inner); } catch (e) { sendSealed(s, { type: "error", id: inner.id, error: e.message || String(e) }); }
+          return;
+        }
+        // Unsealed camera requests never count, even after auth: a hub could inject them.
+        case "cameras": case "command": case "capture":
+          return send({ type: "error", id: m.id, error: "agent not authenticated" });
+      }
+    } catch (e) {
+      if (m.id) send({ type: "error", id: m.id, error: e.message || String(e) });
+    }
+  }
+
+  async function camera(s, m) {
+    switch (m.type) {
+      case "cameras": {
+        const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput");
+        const track = stream && stream.getVideoTracks()[0];
+        const torch = !!(track && track.getCapabilities && track.getCapabilities().torch);
+        return sendSealed(s, { ...state(m.id, "cameras"), host: { name: "web", platform: "web" },
+          cameras: devs.map((d, i) => ({ id: d.deviceId || String(i), facing: /front|user/i.test(d.label) ? "front" : "back", torch: false, minZoom: 1, maxZoom: 1 }))
+            .map(c => c.facing === side() ? { ...c, torch, minZoom: zoomRange().min, maxZoom: zoomRange().max } : c) });
+      }
+      case "command":
+        if (m.camera) {
+          const want = m.camera === "front" || m.camera === "user" ? "user" : m.camera === "back" || m.camera === "environment" ? "environment" : null;
+          if (!want) throw new Error("unknown camera " + m.camera + " (want front or back)");
+          if (want !== facing) { facing = want; await startCamera(); }
+        }
+        if (typeof m.torchOn === "boolean") await applyTorch(m.torchOn);
+        if (typeof m.zoomLevel === "number") await applyZoom(m.zoomLevel);
+        return sendSealed(s, state(m.id, "status"));
+      case "capture": {
+        const { b, w, h } = await captureJpeg(m.quality, m.maxWidth);
+        const buf = await b.arrayBuffer();
+        return sendSealed(s, { ...state(m.id, "frame"), mime: "image/jpeg", bytes: buf.byteLength, width: w, height: h }, buf);
+      }
+      default: throw new Error("unknown request " + m.type);
+    }
+  }
+
+  // An agent arrived or left. The hub repeats status, so act only on a change. A linked phone
+  // challenges every arriving agent; one that neither proves the key nor starts pairing in 15s
+  // is dropped so it cannot squat the slot.
+  function onPresence(present) {
+    if (present && agentHere) return;
+    agentHere = present; seal = null; challenge = null; pairing = null; clearTimeout(squatTimer);
+    setStatus(present ? "agent connecting" : "connected, waiting for the agent");
+    if (!present) return;
+    squatTimer = setTimeout(() => { if (!seal && !pairing) reject(); }, 15000);
+    if (ident.key) { challenge = rand(16); send({ type: "auth", nonce: toHex(challenge) }); }
+  }
+  function reject() {
+    send({ type: "reject" });
+    agentHere = false; seal = null; challenge = null; pairing = null; clearTimeout(squatTimer);
+    setStatus("refused an agent that could not prove the link");
+  }
+
+  function connect() {
+    hubEl.blur();
+    const url = hubEl.value.trim();
+    if (!/^wss?:\/\//.test(url)) return setStatus("hub URL must start with ws:// or wss://");
+    if (ws) try { ws.close(); } catch {}
+    setStatus("connecting to " + new URL(url).host);
+    ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => send({ type: "hello", role: "host", device: ident.device, host: { name: "web", platform: "web" } });
+    // One message at a time, so sealed sequence checks follow arrival order. "Agent left" is
+    // also seen at once, because the queue may be parked on the pairing prompt.
+    let inbox = Promise.resolve();
+    ws.onmessage = (ev) => {
+      if (typeof ev.data === "string" && /"type":"(status|welcome)"/.test(ev.data) && !JSON.parse(ev.data).connected) cancelConfirm();
+      inbox = inbox.then(() => onMessage(ev));
+    };
+    // Stay linked through network drops: redial this socket's URL until a newer connect() replaces it.
+    const mine = ws;
+    ws.onclose = () => {
+      cancelConfirm(); agentHere = false; seal = null;
+      if (ws !== mine) return;
+      setStatus("disconnected, reconnecting");
+      setTimeout(() => { if (ws === mine) connect(); }, 3000);
+    };
+  }
+
+  $("connect").onclick = connect;
+  hubEl.onkeydown = (e) => { if (e.key === "Enter") connect(); };
+  $("flip").onclick = async () => { facing = facing === "environment" ? "user" : "environment"; try { await startCamera(); } catch (e) { setStatus(e.message); } };
+  torchBtn.onclick = () => applyTorch(!torchOn).catch(e => setStatus(e.message));
+  startCamera().then(connect).catch(e => setStatus(e.message));
+})();
+</script>
+</body>
+</html>

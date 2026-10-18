@@ -1,0 +1,10 @@
+#!/bin/sh
+APP_HOME=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+CLASSPATH="$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+if [ -n "$JAVA_HOME" ]; then
+  JAVACMD="$JAVA_HOME/bin/java"
+else
+  JAVACMD=java
+fi
+# shellcheck disable=SC2086
+exec "$JAVACMD" ${GRADLE_OPTS:--Xmx2g -Dfile.encoding=UTF-8} -classpath "$CLASSPATH" org.gradle.wrapper.GradleWrapperMain "$@"
