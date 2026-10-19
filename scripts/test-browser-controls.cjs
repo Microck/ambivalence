@@ -155,3 +155,69 @@ test('repeated active device and default selector keep the live stream and contr
   assert.equal(stops, 2);
   assert.equal(constraints.video.facingMode.ideal, 'user');
 });
+
+test('invalid hub URLs are reported without throwing or closing the current socket', () => {
+  const connectSource = html.slice(html.indexOf('  function connect()'), html.indexOf('  $("connect").onclick'));
+  for (const value of ['ws://', 'wss://example.test/#fragment', 'ws://example.test/v1#', 'ws://user:pass@example.test/v1']) {
+    let status = '', closed = false;
+    const context = vm.createContext({ URL, hubEl: { value, blur() {} },
+      ws: { close() { closed = true; } }, setStatus(s) { status = s; },
+      WebSocket: class { constructor() { throw new Error('must not open a socket'); } } });
+    vm.runInContext(connectSource, context);
+    assert.doesNotThrow(() => context.connect(), value);
+    assert.match(status, /invalid hub URL/);
+    assert.equal(closed, false);
+  }
+});
+
+test('repeated same-size captures reuse the canvas but draw every frame', async () => {
+  let width = 0, height = 0, resets = 0, draws = 0;
+  const canvas = {
+    get width() { return width; }, set width(v) { width = v; resets++; },
+    get height() { return height; }, set height(v) { height = v; resets++; },
+    getContext() { return { drawImage() { draws++; } }; },
+    toBlob(callback) { callback({ size: 1 }); },
+  };
+  const context = vm.createContext({ canvas, video: { videoWidth: 1920, videoHeight: 1080 },
+    stream: { getVideoTracks() { return [{ readyState: 'live' }]; } } });
+  vm.runInContext(html.slice(html.indexOf('  function captureJpeg'), html.indexOf('  const send =')), context);
+  const first = await context.captureJpeg(80, 1280);
+  const second = await context.captureJpeg(80, 1280);
+  assert.equal(first.w, 1280); assert.equal(second.h, 720);
+  assert.equal(resets, 2); assert.equal(draws, 2);
+  await context.captureJpeg(80, 640);
+  assert.equal(width, 640); assert.equal(height, 360);
+  assert.equal(resets, 4); assert.equal(draws, 3);
+});
+
+test('late close from a replaced socket does not reset the current link', () => {
+  const sockets = [];
+  let cancelled = 0;
+  class Socket {
+    constructor() { sockets.push(this); }
+    close() {}
+  }
+  const context = vm.createContext({ URL, WebSocket: Socket, ws: null,
+    hubEl: { value: 'ws://127.0.0.1:17842/v1', blur() {} }, setStatus() {},
+    cancelConfirm() { cancelled++; }, agentHere: true, seal: { active: true },
+    clearTimeout() {}, squatTimer: null, challenge: null, pairing: null,
+    setTimeout() {}, send() {}, onMessage() {}, ident: { device: 'fixture' } });
+  vm.runInContext(html.slice(html.indexOf('  function connect()'), html.indexOf('  $("connect").onclick')), context);
+  context.connect(); context.connect();
+  context.agentHere = true; context.seal = {active:true}; cancelled = 0;
+  sockets[0].onclose();
+  assert.equal(cancelled, 0); assert.equal(context.agentHere, true);
+  assert.equal(context.seal.active, true);
+});
+
+test('replacement socket clears the previous peer authentication state', () => {
+  const context = vm.createContext({ URL, WebSocket: class { close() {} },
+    ws: {close() {}}, hubEl: {value:'ws://127.0.0.1:17842/v1',blur() {}},
+    setStatus() {}, cancelConfirm() {}, clearTimeout() {}, setTimeout() {},
+    agentHere:true, seal:{old:true}, challenge:{old:true}, pairing:{old:true}, squatTimer:123,
+    ident:{device:'fixture'}, send() {}, onMessage() {} });
+  vm.runInContext(html.slice(html.indexOf('  function connect()'),html.indexOf('  $("connect").onclick')),context);
+  context.connect();
+  assert.equal(context.agentHere,false);
+  for(const field of ['seal','challenge','pairing']) assert.equal(context[field],null);
+});

@@ -1,0 +1,12 @@
+{
+  "name": "ambivalence-browser-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:e2e": "node e2e-runner.mjs"
+  },
+  "devDependencies": {
+    "e2e": "0.21.2",
+    "@e2e-dev/web": "0.15.2"
+  }
+}

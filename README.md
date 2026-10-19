@@ -311,3 +311,14 @@ bash scripts/e2e-fake.sh   # pairs a fake phone, restarts it and reconnects
 ## license
 
 [mit](LICENSE)
+
+## deterministic browser flow tests
+
+The root development-only `package.json` is separate from the published `npm/`
+package. Run `npm ci`, `npx e2e-web install chromium`, and `npm run test:e2e`.
+The tester-army/e2e suite uses no model calls and simulates camera denial rather
+than requesting access to real hardware. It covers the host controls, invalid
+hub addresses, mobile layout and recoverable errors. Existing Go tests,
+`scripts/e2e-fake.sh` and browser-control unit tests cover separate contracts.
+Physical camera quality, hardware constraints and native mobile acceptance still
+require device testing; a simulated browser pass does not establish those.
