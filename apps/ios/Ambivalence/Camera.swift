@@ -288,7 +288,8 @@ final class Camera: NSObject, @unchecked Sendable {
         if fm == "auto" { if let point { d.focusPointOfInterest = point }; d.focusMode = .continuousAutoFocus }
         if let t, let iso { applied.enter(); d.setExposureModeCustom(duration: CMTime(seconds: t, preferredTimescale: 1_000_000_000), iso: Float(iso)) { _ in applied.leave() } }
         if em == "auto" { d.exposureMode = .continuousAutoExposure }
-        if let ev { applied.enter(); d.setExposureTargetBias(Float(ev)) { _ in applied.leave() } }
+        // Replacing the exposure group with auto also clears an earlier EV bias.
+        if let bias = ev ?? (em == "auto" ? 0 : nil) { applied.enter(); d.setExposureTargetBias(Float(bias)) { _ in applied.leave() } }
         if let gains { applied.enter(); d.setWhiteBalanceModeLocked(with: gains) { _ in applied.leave() } }
         if wm == "auto" { d.whiteBalanceMode = .continuousAutoWhiteBalance }
         d.unlockForConfiguration()

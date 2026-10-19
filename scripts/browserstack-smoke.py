@@ -156,8 +156,11 @@ def manual_controls() -> None:
         if caps.get("focusPoint"):
             configure(focusMode="auto", focusPoint={"x": 0.5, "y": 0.5})
         if "exposureCompensation" in caps:
-            settings = configure(exposureMode="auto", exposureCompensation=0)
-            assert abs(settings["exposureCompensation"]) < 0.01, settings
+            bias = max(caps["exposureCompensation"]["min"], min(1, caps["exposureCompensation"]["max"]))
+            settings = configure(exposureMode="auto", exposureCompensation=bias)
+            assert abs(settings["exposureCompensation"] - bias) <= max(caps["exposureCompensation"].get("step", 0), 0.01), settings
+            settings = configure(exposureMode="auto")
+            assert abs(settings.get("exposureCompensation", 0)) < 0.01, settings
         agent("capture", "--max-width", "640", "-o", str(OUT / f"{DEVICE}-lens-{index}-auto.jpg"))
 
 
