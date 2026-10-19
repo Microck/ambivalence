@@ -231,7 +231,7 @@ final class Camera: NSObject, @unchecked Sendable {
 
     private func settings(_ d: AVCaptureDevice) -> [String: Any] {
         let g = d.deviceWhiteBalanceGains
-        return ["focusMode": d.focusMode == .locked ? "manual" : "auto", "focusPosition": d.lensPosition,
+        return ["focusMode": d.focusMode == .locked ? "manual" : "auto", "focusPosition": 1 - d.lensPosition,
                 "exposureMode": d.exposureMode == .custom ? "manual" : "auto", "exposureTime": CMTimeGetSeconds(d.exposureDuration),
                 "iso": d.iso, "exposureCompensation": d.exposureTargetBias,
                 "whiteBalanceMode": d.whiteBalanceMode == .locked ? "manual" : "auto",
@@ -283,7 +283,8 @@ final class Camera: NSObject, @unchecked Sendable {
         if wm == "auto" && !d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { throw LinkError("auto white balance unsupported") }
         try d.lockForConfiguration()
         let applied = DispatchGroup()
-        if let fp { applied.enter(); d.setFocusModeLocked(lensPosition: Float(fp)) { _ in applied.leave() } }
+        // AVFoundation runs nearest-to-farthest, opposite to the wire's focus position.
+        if let fp { applied.enter(); d.setFocusModeLocked(lensPosition: Float(1 - fp)) { _ in applied.leave() } }
         if fm == "auto" { if let point { d.focusPointOfInterest = point }; d.focusMode = .continuousAutoFocus }
         if let t, let iso { applied.enter(); d.setExposureModeCustom(duration: CMTime(seconds: t, preferredTimescale: 1_000_000_000), iso: Float(iso)) { _ in applied.leave() } }
         if em == "auto" { d.exposureMode = .continuousAutoExposure }

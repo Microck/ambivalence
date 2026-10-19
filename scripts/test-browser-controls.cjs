@@ -5,18 +5,29 @@ const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const html = readFileSync('internal/hub/web/index.html', 'utf8');
-const source = html.slice(html.indexOf('  // Image Capture exposureTime'), html.indexOf('  function captureJpeg'));
+const source = html.slice(html.indexOf('  async function applyTrackChanges'), html.indexOf('  function captureJpeg'));
 function host(ignore = false) {
   const caps = { focusMode: ['manual', 'continuous'], focusDistance: { min: 0.1, max: 100, step: 0.01 },
     exposureMode: ['manual', 'continuous'], exposureTime: { min: 1, max: 10000, step: 1 }, iso: { min: 50, max: 1600, step: 1 },
     exposureCompensation: { min: -2, max: 2, step: 0.1 }, whiteBalanceMode: ['manual', 'continuous'], colorTemperature: { min: 2000, max: 8000, step: 1 } };
-  const settings = { focusMode: 'continuous', exposureMode: 'continuous', whiteBalanceMode: 'continuous' };
+  const defaults = { focusMode: 'continuous', exposureMode: 'continuous', whiteBalanceMode: 'continuous' };
+  const settings = { ...defaults };
+  let constraints = { deviceId: { exact: 'tele-id' }, width: { ideal: 1920 } };
   let calls = 0;
-  const track = { getCapabilities: () => caps, getSettings: () => settings,
-    applyConstraints: async c => { calls++; if (!ignore) Object.assign(settings, c.advanced[0]); } };
+  // Like MediaStreamTrack, this fixture replaces constraints and restores omitted
+  // properties to defaults, rather than treating applyConstraints as a patch.
+  const track = { getCapabilities: () => caps, getSettings: () => settings, getConstraints: () => constraints,
+    applyConstraints: async c => {
+      calls++;
+      constraints = c;
+      if (!ignore) {
+        for (const key of Object.keys(settings)) delete settings[key];
+        Object.assign(settings, defaults, c.advanced[0]);
+      }
+    } };
   const context = vm.createContext({ stream: { getVideoTracks: () => [track] } });
   vm.runInContext(source, context);
-  return { context, caps, settings, calls: () => calls };
+  return { context, caps, settings, track, calls: () => calls };
 }
 test('seconds convert to browser units; settings convert back', async () => {
   const h = host();
@@ -44,6 +55,29 @@ test('invalid, unsupported and incomplete controls never reach hardware', async 
     { whiteBalanceMode: 'manual', whiteBalanceGains: { red: 1, green: 1, blue: 1 } },
     { exposureCompensation: NaN }, { focusMode: 'bogus' }, { unknown: 1 }]) await assert.rejects(h.context.applyControls(c));
   assert.equal(h.calls(), 0);
+});
+test('independent groups, torch and zoom retain constraints; auto clears only its group', async () => {
+  const h = host();
+  await h.context.applyControls({ focusMode: 'manual', focusPosition: 0 });
+  await h.context.applyControls({ exposureMode: 'manual', exposureTime: 0.01, iso: 100 });
+  await h.context.applyControls({ whiteBalanceMode: 'manual', whiteBalanceTemperature: 5600 });
+  await h.context.applyTrackChanges(h.track, { torch: true });
+  await h.context.applyTrackChanges(h.track, { zoom: 2 });
+  assert.equal(h.settings.focusMode, 'manual');
+  assert.equal(h.settings.focusDistance, 100);
+  assert.equal(h.settings.exposureTime, 100);
+  assert.equal(h.settings.colorTemperature, 5600);
+  assert.equal(h.settings.torch, true);
+  assert.equal(h.settings.zoom, 2);
+  assert.equal(h.track.getConstraints().deviceId.exact, 'tele-id');
+  assert.equal(h.track.getConstraints().width.ideal, 1920);
+  await h.context.applyControls({ exposureMode: 'auto' });
+  assert.equal(h.settings.exposureMode, 'continuous');
+  assert.equal(h.settings.exposureTime, undefined);
+  assert.equal(h.settings.iso, undefined);
+  assert.equal(h.settings.focusMode, 'manual');
+  assert.equal(h.settings.whiteBalanceMode, 'manual');
+  assert.equal(h.settings.torch, true);
 });
 test('ignored advanced constraints return an error', async () => {
   const h = host(true);

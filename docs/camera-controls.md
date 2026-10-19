@@ -51,7 +51,8 @@ Missing capabilities mean unsupported/unknown, never permission to assume suppor
 Android uses the MANUAL_SENSOR and MANUAL_POST_PROCESSING flags for shutter/ISO
 and RGB controls. Fixed-focus lenses do not gain manual focusing through software.
 
-Omitted control groups stay configured; explicitly switching a group to `auto`
+Omitted control groups stay configured, including across torch and zoom commands;
+explicitly switching a group to `auto`
 clears its manual values. Lens changes start a new native camera configuration;
 configure the lens after switching. An explicit mode is required when supplying
 manual values. EV bias cannot be combined with manual exposure. Requests validate

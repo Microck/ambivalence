@@ -172,7 +172,7 @@
     const track = stream && stream.getVideoTracks()[0];
     const caps = track && track.getCapabilities ? track.getCapabilities() : {};
     if (!caps.torch) throw new Error("this camera has no torch");
-    await track.applyConstraints({ advanced: [{ torch: on }] });
+    await applyTrackChanges(track, { torch: on });
     setTorch(on);
   }
 
@@ -185,8 +185,24 @@
   async function applyZoom(level) {
     const { min, max } = zoomRange();
     if (level < min || level > max) throw new Error(`zoom ${level} out of range ${min}-${max}`);
-    if (max > min) await stream.getVideoTracks()[0].applyConstraints({ advanced: [{ zoom: level }] });
+    if (max > min) await applyTrackChanges(stream.getVideoTracks()[0], { zoom: level });
     zoomLevel = level;
+  }
+
+  async function applyTrackChanges(track, changes) {
+    // applyConstraints replaces the whole constraint set. Retain resolution, selected
+    // device and omitted controls; an explicit mode replaces just its own group.
+    const constraints = track.getConstraints();
+    const controls = Object.assign({}, ...(constraints.advanced || []));
+    const groups = {
+      focusMode: ["focusMode", "focusDistance"],
+      exposureMode: ["exposureMode", "exposureTime", "iso", "exposureCompensation"],
+      whiteBalanceMode: ["whiteBalanceMode", "colorTemperature"]
+    };
+    for (const [mode, keys] of Object.entries(groups)) {
+      if (mode in changes) for (const key of keys) delete controls[key];
+    }
+    await track.applyConstraints({ ...constraints, advanced: [{ ...controls, ...changes }] });
   }
 
   // Image Capture exposureTime is in 100 microsecond units; the wire uses seconds.
@@ -252,7 +268,7 @@
     if ("whiteBalanceTemperature" in request) number("whiteBalanceTemperature", "colorTemperature", request.whiteBalanceTemperature);
     // Advanced constraints are necessary for Image Capture extensions. Verify settings
     // afterwards: browsers are allowed to ignore an unsupported advanced constraint.
-    await track.applyConstraints({ advanced: [changes] });
+    await applyTrackChanges(track, changes);
     const actual = track.getSettings();
     for (const [key, value] of Object.entries(changes)) {
       const tolerance = Math.max(caps[key]?.step || 0, typeof value === "number" ? Math.abs(value) * 0.01 : 0, 1e-6);
