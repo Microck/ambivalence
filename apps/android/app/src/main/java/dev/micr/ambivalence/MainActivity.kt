@@ -434,7 +434,7 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
             val cam = camera ?: fail("camera not ready")
             val future = Camera2CameraControl.from(cam.cameraControl).setCaptureRequestOptions(options)
             future.addListener({
-                try { future.get(); configured = merged; applyControls(f, torch, zoom) }
+                try { future.get(); configured = manual().accepted(merged); applyControls(f, torch, zoom) }
                 catch (e: Exception) { f.completeExceptionally(e.cause ?: e) }
             }, mainExecutor)
         } catch (e: Exception) { f.completeExceptionally(e) }

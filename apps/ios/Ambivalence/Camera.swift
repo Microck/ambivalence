@@ -127,6 +127,7 @@ final class Camera: NSObject, @unchecked Sendable {
     }
 
     private func bindDevice(_ device: AVCaptureDevice) -> String? {
+        if input?.device.uniqueID == device.uniqueID { return nil }
         let pos = device.position
         let newInput: AVCaptureDeviceInput
         do { newInput = try AVCaptureDeviceInput(device: device) } catch { return error.localizedDescription }
@@ -141,6 +142,16 @@ final class Camera: NSObject, @unchecked Sendable {
         session.addInput(newInput)
         if !session.outputs.contains(photo), session.canAddOutput(photo) { session.addOutput(photo) }
         input = newInput
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
+            if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+            if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
+            device.setExposureTargetBias(0, completionHandler: nil)
+            device.videoZoomFactor = max(device.minAvailableVideoZoomFactor, min(1, device.maxAvailableVideoZoomFactor))
+            if device.hasTorch { device.torchMode = .off }
+        } catch { return error.localizedDescription }
         return nil
     }
 
@@ -207,13 +218,13 @@ final class Camera: NSObject, @unchecked Sendable {
 
     private func capabilities(_ d: AVCaptureDevice) -> [String: Any] {
         let f = d.activeFormat
-        return ["controlsVersion": 1, "focusMode": ["auto"] + (d.isLockingFocusWithCustomLensPositionSupported ? ["manual"] : []),
+        return ["controlsVersion": 1, "focusMode": (d.isFocusModeSupported(.continuousAutoFocus) ? ["auto"] : []) + (d.isLockingFocusWithCustomLensPositionSupported ? ["manual"] : []),
                 "focusPosition": ["min": 0, "max": 1], "focusPoint": d.isFocusPointOfInterestSupported,
-                "exposureMode": ["auto"] + (d.isExposureModeSupported(.custom) ? ["manual"] : []),
+                "exposureMode": (d.isExposureModeSupported(.continuousAutoExposure) ? ["auto"] : []) + (d.isExposureModeSupported(.custom) ? ["manual"] : []),
                 "exposureTime": ["min": CMTimeGetSeconds(f.minExposureDuration), "max": CMTimeGetSeconds(f.maxExposureDuration)],
                 "iso": ["min": f.minISO, "max": f.maxISO],
                 "exposureCompensation": ["min": d.minExposureTargetBias, "max": d.maxExposureTargetBias],
-                "whiteBalanceMode": ["auto"] + (d.isWhiteBalanceModeSupported(.locked) ? ["manual"] : []),
+                "whiteBalanceMode": (d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) ? ["auto"] : []) + (d.isWhiteBalanceModeSupported(.locked) ? ["manual"] : []),
                 "whiteBalanceGains": ["min": 1, "max": d.maxWhiteBalanceGain],
                 "whiteBalanceTemperature": ["min": 1000, "max": 15000]]
     }

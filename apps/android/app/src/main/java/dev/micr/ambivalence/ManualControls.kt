@@ -38,6 +38,9 @@ internal class ManualControls(private val chars: C) {
         if (manualColor) c.put("whiteBalanceGains", JSONObject().put("min", 1))
         return c
     }
+    fun accepted(c: JSONObject): JSONObject = JSONObject(c.toString()).apply {
+        if (has("exposureCompensation") && evStep > 0) put("exposureCompensation", (getDouble("exposureCompensation") / evStep).roundToInt() * evStep)
+    }
     private fun range(lo: Double, hi: Double) = JSONObject().put("min", lo).put("max", hi)
 
     fun options(c: JSONObject): CaptureRequestOptions {

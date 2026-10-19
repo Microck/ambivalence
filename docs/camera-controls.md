@@ -60,7 +60,7 @@ can still leave partial changes, so inspect settings before retrying.
 
 Status and capture metadata include `cameraId` and `settings`. iOS reports device
 settings after manual setters complete. Android reports the configuration accepted
-by Camera2 (including requested EV, rounded by the driver); these are not measured
+by Camera2 (including EV rounded to the supported step); these are not measured
 per-photo sensor results. Browser settings are read back after constraints apply;
 an ignored or materially different constraint is an error. Automatic focus/exposure
 may still be converging when a command completes. Native point coordinates are not

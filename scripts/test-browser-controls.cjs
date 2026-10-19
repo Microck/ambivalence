@@ -49,3 +49,19 @@ test('ignored advanced constraints return an error', async () => {
   const h = host(true);
   await assert.rejects(h.context.applyControls({ exposureMode: 'manual', exposureTime: 0.01, iso: 100 }), /not applied/);
 });
+test('lens selection requests an exact device ID; aliases use facing hints', async () => {
+  let constraints, stopped = false;
+  const track = { stop: () => { stopped = true; }, getSettings: () => ({ deviceId: 'tele-id', facingMode: 'environment' }) };
+  const stream = { getTracks: () => [track], getVideoTracks: () => [track] };
+  const context = vm.createContext({ navigator: { mediaDevices: { getUserMedia: async c => { constraints = c; return stream; } } },
+    window: { isSecureContext: true }, stream, facing: 'environment', video: { play: async () => {} }, setTorch: () => {}, zoomLevel: 2 });
+  vm.runInContext(html.slice(html.indexOf('  async function startCamera'), html.indexOf('  async function applyTorch')), context);
+  await context.startCamera('tele-id');
+  assert.equal(constraints.video.deviceId.exact, 'tele-id');
+  assert.equal(constraints.video.facingMode, undefined);
+  assert.equal(stopped, true);
+  assert.equal(context.zoomLevel, 1);
+  await context.startCamera();
+  assert.equal(constraints.video.facingMode.ideal, 'environment');
+  assert.equal(constraints.video.deviceId, undefined);
+});
