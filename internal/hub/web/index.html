@@ -157,6 +157,12 @@
       throw new Error("the camera needs HTTPS. Open the https:// tunnel URL printed by `ambivalence hub --tunnel`");
     }
     if (stream) stream.getTracks().forEach(t => t.stop());
+    // Mobile cameras may require releasing the old stream before opening another.
+    // If acquisition fails, keep no stopped stream that could return a frozen JPEG.
+    stream = null;
+    video.srcObject = null;
+    setTorch(false);
+    zoomLevel = 1;
     stream = await navigator.mediaDevices.getUserMedia({
       audio: false, video: { ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: facing } }), width: { ideal: 1920 }, height: { ideal: 1080 } }
     });
@@ -164,8 +170,6 @@
     const actualFacing = stream.getVideoTracks()[0].getSettings().facingMode;
     facing = actualFacing || "unknown";
     await video.play();
-    setTorch(false);
-    zoomLevel = 1; // a new stream starts unzoomed
   }
 
   async function applyTorch(on) {
@@ -277,6 +281,7 @@
   }
 
   function captureJpeg(quality, maxWidth) {
+    if (stream?.getVideoTracks()[0]?.readyState !== "live") return Promise.reject(new Error("camera not ready; select a camera to reopen it"));
     let w = video.videoWidth, h = video.videoHeight;
     if (!w) return Promise.reject(new Error("camera not ready"));
     const scale = Math.min(1, (maxWidth || 1280) / Math.max(w, h));
@@ -287,7 +292,7 @@
   }
 
   const send = (o) => { o.v = 1; ws.send(JSON.stringify(o)); };
-  const side = () => facing === "user" ? "front" : facing === "environment" ? "back" : "unknown";
+  const side = () => !stream ? "unknown" : facing === "user" ? "front" : facing === "environment" ? "back" : "unknown";
   const state = (id, type) => ({ type, id, facing: side(), cameraId: stream?.getVideoTracks()[0].getSettings().deviceId || "", capabilities: controlCapabilities(stream?.getVideoTracks()[0]), settings: controlSettings(), torch: torchOn, zoom: zoomLevel, connected: true });
 
   // Replies to a sealed request go back sealed; a frame's JPEG follows as its own sealed box.

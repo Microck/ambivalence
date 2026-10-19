@@ -99,3 +99,18 @@ test('lens selection requests an exact device ID; aliases use facing hints', asy
   assert.equal(constraints.video.facingMode.ideal, 'environment');
   assert.equal(constraints.video.deviceId, undefined);
 });
+test('failed camera acquisition clears the stopped stream and rejects frozen captures', async () => {
+  let stopped = false;
+  const stream = { getTracks: () => [{ stop: () => { stopped = true; } }] };
+  const context = vm.createContext({ navigator: { mediaDevices: { getUserMedia: async () => { throw new Error('camera unavailable'); } } },
+    window: { isSecureContext: true }, stream, facing: 'environment', video: { srcObject: stream, videoWidth: 1920, videoHeight: 1080 },
+    setTorch: () => {}, zoomLevel: 2 });
+  vm.runInContext(html.slice(html.indexOf('  async function startCamera'), html.indexOf('  async function applyTorch')), context);
+  vm.runInContext(html.slice(html.indexOf('  function captureJpeg'), html.indexOf('  const send =')), context);
+  await assert.rejects(context.startCamera('gone-camera'), /camera unavailable/);
+  assert.equal(stopped, true);
+  assert.equal(context.stream, null);
+  assert.equal(context.video.srcObject, null);
+  assert.equal(context.zoomLevel, 1);
+  await assert.rejects(context.captureJpeg(80, 320), /camera not ready/);
+});

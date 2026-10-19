@@ -16,6 +16,8 @@ the phone/browser; do not infer a lens from the ID or assume IDs work on another
   exact `deviceId`, never a facing-mode hint. Browser/OS policy may expose fewer
   cameras than the native app. Capabilities are available for the active input;
   select another input and list again to inspect it.
+  If opening a lens fails, select an available camera to reopen the stream;
+  captures fail until then rather than returning the stopped camera's last frame.
 
 ## Configure
 
