@@ -132,7 +132,7 @@ the mcp tools are:
 | --- | --- |
 | `camera_capture` | takes a photo and returns the jpeg to the model |
 | `camera_connect` | pairs with a code, or reconnects to the linked phone |
-| `camera_switch` | switches to the `front` or `back` camera |
+| `camera_switch` | selects an exact camera ID, or the `front` or `back` default |
 | `camera_torch` | turns the torch on or off |
 | `camera_zoom` | sets the zoom factor |
 | `camera_list` | lists selectable lenses, zoom ranges and supported manual controls |
@@ -151,7 +151,9 @@ ambivalence hub &                         # skip this if ambivalence mcp is runn
 ambivalence pair K9RBCY                   # once per phone
 ambivalence capture -o shot.jpg           # any time after
 ambivalence torch on
+ambivalence cameras                       # discover exact lens IDs and capabilities
 ambivalence switch front
+ambivalence configure '{"focusMode":"manual","focusPosition":0}'
 ambivalence zoom 2
 ```
 
