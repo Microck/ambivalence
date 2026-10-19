@@ -10,6 +10,7 @@ import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.roundToInt
+import kotlin.math.roundToLong
 
 /** Camera2 ranges and validation. Normalized focus is 0=infinity, 1=nearest. */
 @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
@@ -87,7 +88,7 @@ internal class ManualControls(private val chars: C) {
             val iso = num("iso", ir.lower.toDouble(), ir.upper.toDouble())
             require(iso == iso.roundToInt().toDouble()) { "ISO must be an integer" }
             b.setCaptureRequestOption(R.CONTROL_AE_MODE, R.CONTROL_AE_MODE_OFF)
-            b.setCaptureRequestOption(R.SENSOR_EXPOSURE_TIME, (t * 1e9).toLong())
+            b.setCaptureRequestOption(R.SENSOR_EXPOSURE_TIME, (t * 1e9).roundToLong())
             b.setCaptureRequestOption(R.SENSOR_SENSITIVITY, iso.toInt())
         } else {
             require(!c.has("exposureTime") && !c.has("iso")) { "shutter and ISO require manual mode" }

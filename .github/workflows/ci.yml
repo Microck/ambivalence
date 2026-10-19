@@ -41,7 +41,13 @@ jobs:
         with:
           packages: platform-tools
       - run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build -o bin/ambivalence ./cmd/ambivalence
       - run: ./gradlew :app:assembleDebug :app:testDebugUnitTest --no-daemon
+        env:
+          AMBIVALENCE_BIN: ${{ github.workspace }}/bin/ambivalence
         working-directory: apps/android
 
   ios:

@@ -68,6 +68,10 @@ class HubClientInteropTest {
             val cams = run(config, "cameras", "--hub", url)
             assertEquals(cams.first, 0, cams.second)
             assertTrue(cams.first, cams.first.contains("fake-back"))
+            val configured = run(config, "configure", """{"focusMode":"manual","focusPosition":0,"exposureMode":"manual","exposureTime":0.008,"iso":100}""", "--hub", url)
+            assertEquals(configured.first, 0, configured.second)
+            assertTrue(configured.first, configured.first.contains("focusPosition"))
+            assertTrue(configured.first, configured.first.contains("0.008"))
             client.disconnect()
         } finally {
             hub.destroy()
@@ -86,11 +90,11 @@ class HubClientInteropTest {
     }
 
     private inner class FakeCamera : CameraHost {
-        override fun cameras(): JSONObject = JSONObject().put("facing", "back").put("torch", false).put("zoom", 1.0)
+        override fun cameras(): JSONObject = JSONObject().put("capabilities", JSONObject().put("controlsVersion", 1)).put("facing", "back").put("torch", false).put("zoom", 1.0)
             .put("cameras", JSONArray().put(JSONObject().put("id", "fake-back").put("facing", "back").put("torch", false).put("minZoom", 1).put("maxZoom", 1)))
             .put("host", JSONObject().put("name", "android").put("platform", "android"))
         override fun command(camera: String?, torchOn: Boolean?, zoom: Double?, controls: JSONObject?): JSONObject =
-            JSONObject().put("facing", "back").put("cameraId", "back").put("torch", false).put("zoom", 1.0).put("connected", true)
+            JSONObject().put("settings", controls ?: JSONObject()).put("facing", "back").put("cameraId", "back").put("torch", false).put("zoom", 1.0).put("connected", true)
         override fun capture(quality: Int, maxWidth: Int): Pair<JSONObject, ByteArray> =
             JSONObject().put("facing", "back").put("cameraId", "back").put("torch", false).put("zoom", 1.0).put("width", 4).put("height", 2) to jpeg
     }
