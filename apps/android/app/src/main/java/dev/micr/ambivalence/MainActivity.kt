@@ -220,14 +220,21 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
                 val previewUse = previewBuilder.build().also { it.setSurfaceProvider(preview.surfaceProvider) }
                 val capture = captureBuilder.build()
                 provider.unbindAll()
+                // Binding can fail after the old use cases have been detached.
+                // Clear them first so captures fail fast and a later switch rebinds.
+                camera = null
+                imageCapture = null
+                selectedId = ""
+                configured = JSONObject()
+                torchOn = false
+                torchButton.text = "torch off"
+                zoom = 1.0
                 camera = provider.bindToLifecycle(this, selector, previewUse, capture)
                 imageCapture = capture
                 lensFacing = facing
                 selectedId = id ?: Camera2CameraInfo.from(camera!!.cameraInfo).cameraId
-                configured = JSONObject()
                 // A new camera starts with the torch off and zoom 1.0.
                 syncTorch(camera!!)
-                zoom = 1.0
                 done(null)
             } catch (e: Exception) {
                 done(e)
