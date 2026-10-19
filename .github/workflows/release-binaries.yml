@@ -29,10 +29,16 @@ jobs:
               CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -buildvcs=false -ldflags='-s -w' -o "release-binaries/ambivalence-$os-$arch$suffix" ./cmd/ambivalence
             done
           done
-          test "$(release-binaries/ambivalence-linux-amd64 version)" = 0.2.1
+          python3 scripts/check-release-version.py release-binaries/ambivalence-linux-amd64
           (cd release-binaries && sha256sum ambivalence-* > checksums.txt)
+          tar -czf ambivalence-cli-binaries.tar.gz -C release-binaries .
+          mkdir extracted-binaries
+          tar -xzf ambivalence-cli-binaries.tar.gz -C extracted-binaries
+          test -x extracted-binaries/ambivalence-linux-amd64
+          (cd extracted-binaries && sha256sum -c checksums.txt)
+          python3 scripts/check-release-version.py extracted-binaries/ambivalence-linux-amd64
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ambivalence-cli-binaries
-          path: release-binaries/
+          path: ambivalence-cli-binaries.tar.gz
           retention-days: 7
