@@ -16,3 +16,5 @@ apps/android/app/.cxx/
 .env
 browserstack.env
 captures/
+node_modules/
+.e2e/

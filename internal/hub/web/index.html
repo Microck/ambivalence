@@ -52,7 +52,7 @@
     <div class="row"><button id="sas-cancel" type="button">cancel</button><button id="sas-ok" type="button">confirm</button></div>
   </div>
   <div class="bar" id="bot">
-    <input id="hub" type="url" inputmode="url" enterkeyhint="go" spellcheck="false" autocapitalize="off" placeholder="hub URL, e.g. wss://….trycloudflare.com/v1">
+    <input id="hub" aria-label="Hub URL" type="url" inputmode="url" enterkeyhint="go" spellcheck="false" autocapitalize="off" placeholder="hub URL, e.g. wss://….trycloudflare.com/v1">
     <div class="row">
       <button id="connect" type="button">connect</button>
       <button id="flip" type="button">flip</button>
@@ -299,7 +299,10 @@
     if (!w) return Promise.reject(new Error("camera not ready"));
     const scale = Math.min(1, (maxWidth || 1280) / Math.max(w, h));
     w = Math.round(w * scale); h = Math.round(h * scale);
-    canvas.width = w; canvas.height = h;
+    // Resizing resets the backing store and drawing state, even at the same size.
+    // drawImage still overwrites the complete output for every captured frame.
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
     canvas.getContext("2d").drawImage(video, 0, 0, w, h);
     return new Promise((ok, fail) => canvas.toBlob(b => b ? ok({ b, w, h }) : fail(new Error("jpeg encode failed")), "image/jpeg", (quality || 80) / 100));
   }
@@ -432,8 +435,15 @@
     hubEl.blur();
     const url = hubEl.value.trim();
     if (!/^wss?:\/\//.test(url)) return setStatus("hub URL must start with ws:// or wss://");
+    let parsed;
+    try {
+      parsed = new URL(url);
+      if (!parsed.hostname || parsed.username || parsed.password || parsed.hash) throw new Error("invalid URL");
+    } catch {
+      return setStatus("invalid hub URL: use ws:// or wss:// with a host, without credentials or a fragment");
+    }
     if (ws) try { ws.close(); } catch {}
-    setStatus("connecting to " + new URL(url).host);
+    setStatus("connecting to " + parsed.host);
     ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
     ws.onopen = () => send({ type: "hello", role: "host", device: ident.device, host: { name: "web", platform: "web" } });
@@ -447,8 +457,8 @@
     // Stay linked through network drops: redial this socket's URL until a newer connect() replaces it.
     const mine = ws;
     ws.onclose = () => {
-      cancelConfirm(); agentHere = false; seal = null;
       if (ws !== mine) return;
+      cancelConfirm(); agentHere = false; seal = null;
       setStatus("disconnected, reconnecting");
       setTimeout(() => { if (ws === mine) connect(); }, 3000);
     };
