@@ -568,6 +568,16 @@ func TestLensAndManualControlsSealedRoundTrip(t *testing.T) {
 	if got.Meta.CameraID != "fake-front" || got.Meta.Facing != "front" || got.Meta.Settings["focusPosition"] != float64(0) || got.Meta.Settings["iso"] != iso {
 		t.Fatalf("wrong configuration: %+v", got.Meta)
 	}
+	for _, id := range []string{"fake-front", "front"} {
+		got, err = sess.Command(ctx, protocol.Message{Camera: id})
+		if err != nil || got.Meta.Settings["iso"] != iso || got.Meta.Settings["focusPosition"] != zero {
+			t.Fatalf("reselecting %s reset controls: %+v %v", id, got.Meta.Settings, err)
+		}
+	}
+	listed, err := sess.Cameras(ctx)
+	if err != nil || listed.Meta.Capabilities["focusPoint"] != true || len(listed.Meta.Cameras[0].Capabilities) == 0 {
+		t.Fatalf("fake controls not advertised: %+v %v", listed.Meta, err)
+	}
 	fr, err := sess.Capture(ctx, 70, 320)
 	if err != nil || fr.Meta.CameraID != "fake-front" || fr.Meta.Settings["exposureTime"] != shutter {
 		t.Fatalf("capture metadata: %+v %v", fr.Meta, err)

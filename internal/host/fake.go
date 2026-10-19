@@ -11,6 +11,7 @@ import (
 	"image/color"
 	"image/draw"
 	"image/jpeg"
+	"math"
 	"os"
 	"sync"
 	"time"
@@ -113,11 +114,26 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 	facing := "back"
 	cameraID := "fake-back"
 	settings := map[string]any{}
-	capabilities := map[string]any{"controlsVersion": 1}
+	// The test host records control state without sensor limits. These ranges
+	// describe the finite values accepted by Controls.Validate.
+	positive := map[string]any{"min": math.SmallestNonzeroFloat64, "max": math.MaxFloat64}
+	capabilities := map[string]any{
+		"controlsVersion":         1,
+		"focusMode":               []string{"auto", "manual"},
+		"focusPosition":           map[string]any{"min": 0, "max": 1},
+		"focusPoint":              true,
+		"exposureMode":            []string{"auto", "manual"},
+		"exposureTime":            positive,
+		"iso":                     positive,
+		"exposureCompensation":    map[string]any{"min": -math.MaxFloat64, "max": math.MaxFloat64},
+		"whiteBalanceMode":        []string{"auto", "manual"},
+		"whiteBalanceTemperature": positive,
+		"whiteBalanceGains":       map[string]any{"min": 1, "max": math.MaxFloat64},
+	}
 	cams := []protocol.Camera{{
-		ID: "fake-back", Facing: "back", Torch: true, MinZoom: 1, MaxZoom: 8,
+		ID: "fake-back", Facing: "back", Torch: true, MinZoom: 1, MaxZoom: 8, Capabilities: capabilities,
 	}, {
-		ID: "fake-front", Facing: "front", Torch: false, MinZoom: 1, MaxZoom: 2,
+		ID: "fake-front", Facing: "front", Torch: false, MinZoom: 1, MaxZoom: 2, Capabilities: capabilities,
 	}}
 
 	// Per-agent state: reset whenever an agent arrives or leaves. seal is set once the agent has
@@ -173,6 +189,9 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 				found := false
 				for _, cam := range cams {
 					if m.Camera == cam.ID || m.Camera == cam.Facing {
+						if cameraID != cam.ID {
+							settings = map[string]any{}
+						}
 						facing = cam.Facing
 						cameraID = cam.ID
 						found = true
@@ -183,7 +202,6 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 					reply(protocol.Message{Type: protocol.TypeError, Err: "unknown camera"}, nil)
 					return
 				}
-				settings = map[string]any{}
 			}
 			if m.Controls != nil {
 				if err := m.Controls.Validate(); err != nil {
