@@ -109,10 +109,13 @@ def restart_app(base: str) -> None:
     call("POST", f"{base}/appium/device/activate_app", json.dumps(ident).encode(), JSON)
 
 
-def manual_controls() -> None:
+def manual_controls(base: str) -> None:
     """Check exact lenses and independent controls against each lens's advertised ranges."""
     cameras = json.loads(agent("cameras"))["cameras"]
     for index, camera in enumerate(cameras):
+        # CLI camera traffic does not count as Appium activity. Keep the device
+        # session alive while testing phones with many selectable lenses.
+        text(base, "status_text")
         agent("switch", camera["id"])
         state = json.loads(agent("cameras"))
         assert state["cameraId"] == camera["id"], "exact lens was not selected"
@@ -187,7 +190,7 @@ def main() -> None:
         code = text(base, "pair_code").strip()
         print("phone:", code, "|", text(base, "status_text"))
         pair(base, code)
-        manual_controls()
+        manual_controls(base)
         agent("switch", "back")
         # Everything after pairing uses the saved link: no code.
         agent("capture", "--max-width", "1280", "-o", str(OUT / f"{DEVICE}-back.jpg"))
