@@ -111,7 +111,12 @@ def restart_app(base: str) -> None:
 
 def manual_controls(base: str) -> None:
     """Check exact lenses and independent controls against each lens's advertised ranges."""
-    cameras = json.loads(agent("cameras"))["cameras"]
+    initial = json.loads(agent("cameras"))
+    cameras = initial["cameras"]
+    defaults = {initial["facing"]: initial["cameraId"]}
+    agent("switch", "front")
+    front = json.loads(agent("cameras"))
+    defaults["front"] = front["cameraId"]
     for index, camera in enumerate(cameras):
         # CLI camera traffic does not count as Appium activity. Keep the device
         # session alive while testing phones with many selectable lenses.
@@ -150,6 +155,10 @@ def manual_controls(base: str) -> None:
             assert settings["whiteBalanceMode"] == "manual", settings
         else:
             agent("configure", '{"whiteBalanceMode":"manual","whiteBalanceTemperature":5600}', expect_ok=False)
+        if camera["id"] == defaults.get(camera["facing"]):
+            before = json.loads(agent("cameras"))["settings"]
+            agent("switch", camera["facing"])
+            assert json.loads(agent("cameras"))["settings"] == before, "selecting the current default reset its controls"
         agent("capture", "--max-width", "640", "-o", str(OUT / f"{DEVICE}-lens-{index}-manual.jpg"))
         # Reset only supported groups. Fixed-focus cameras cannot accept autofocus.
         auto = {key: "auto" for key in ("focusMode", "exposureMode", "whiteBalanceMode") if "auto" in caps.get(key, [])}

@@ -204,8 +204,14 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
                     selectorBuilder.requireLensFacing(facing)
                 }
                 val selector = selectorBuilder.build()
-                if (!provider.hasCamera(selector)) {
+                val targetInfo = selector.filter(provider.availableCameraInfos).firstOrNull()
+                if (targetInfo == null) {
                     done(IllegalStateException("no ${facingName(facing)} camera"))
+                    return@addListener
+                }
+                val targetId = id ?: Camera2CameraInfo.from(targetInfo).cameraId
+                if (camera != null && selectedId == targetId) {
+                    done(null)
                     return@addListener
                 }
                 val previewBuilder = Preview.Builder()
@@ -232,7 +238,7 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
                 camera = provider.bindToLifecycle(this, selector, previewUse, capture)
                 imageCapture = capture
                 lensFacing = facing
-                selectedId = id ?: Camera2CameraInfo.from(camera!!.cameraInfo).cameraId
+                selectedId = targetId
                 // A new camera starts with the torch off and zoom 1.0.
                 syncTorch(camera!!)
                 done(null)
@@ -409,7 +415,7 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
                     }
                 }
                 f.complete(
-                    JSONObject().put("cameraId", selectedId).put("capabilities", manual().capabilities()).put("settings", JSONObject(configured.toString())).put("facing", facingName(lensFacing)).put("torch", torchOn).put("zoom", zoom).put("cameras", cams)
+                    JSONObject().put("cameraId", selectedId).put("capabilities", if (camera != null) manual().capabilities() else JSONObject().put("controlsVersion", 1)).put("settings", JSONObject(configured.toString())).put("facing", if (camera != null) facingName(lensFacing) else "unknown").put("torch", torchOn).put("zoom", zoom).put("cameras", cams)
                         .put("host", JSONObject().put("name", "android").put("platform", "android")),
                 )
             } catch (e: Exception) {
