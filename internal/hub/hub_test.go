@@ -548,3 +548,62 @@ func TestReplayedAuthOKCannotResetChannels(t *testing.T) {
 		seen[seq] = true
 	}
 }
+
+func TestLensAndManualControlsSealedRoundTrip(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	url := startHub(t, ctx)
+	phone := host.NewPhone("controls-test")
+	sess, _ := pair(t, ctx, phone, url, serve(t, ctx, phone, url))
+	defer sess.Close()
+	if _, err := sess.Command(ctx, protocol.Message{Camera: "fake-front"}); err != nil {
+		t.Fatal(err)
+	}
+	zero, shutter, iso := 0.0, 1.0/125, 100.0
+	control := &protocol.Controls{FocusMode: "manual", FocusPosition: &zero, ExposureMode: "manual", ExposureTime: &shutter, ISO: &iso, WhiteBalanceMode: "manual", WhiteBalanceGains: &protocol.Gains{Red: 2, Green: 1, Blue: 1.5}}
+	got, err := sess.Command(ctx, protocol.Message{Controls: control})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Meta.CameraID != "fake-front" || got.Meta.Facing != "front" || got.Meta.Settings["focusPosition"] != float64(0) || got.Meta.Settings["iso"] != iso {
+		t.Fatalf("wrong configuration: %+v", got.Meta)
+	}
+	for _, id := range []string{"fake-front", "front"} {
+		got, err = sess.Command(ctx, protocol.Message{Camera: id})
+		if err != nil || got.Meta.Settings["iso"] != iso || got.Meta.Settings["focusPosition"] != zero {
+			t.Fatalf("reselecting %s reset controls: %+v %v", id, got.Meta.Settings, err)
+		}
+	}
+	listed, err := sess.Cameras(ctx)
+	if err != nil || listed.Meta.Capabilities["focusPoint"] != true || len(listed.Meta.Cameras[0].Capabilities) == 0 {
+		t.Fatalf("fake controls not advertised: %+v %v", listed.Meta, err)
+	}
+	fr, err := sess.Capture(ctx, 70, 320)
+	if err != nil || fr.Meta.CameraID != "fake-front" || fr.Meta.Settings["exposureTime"] != shutter {
+		t.Fatalf("capture metadata: %+v %v", fr.Meta, err)
+	}
+	got, err = sess.Command(ctx, protocol.Message{Controls: &protocol.Controls{FocusMode: "auto"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, stale := got.Meta.Settings["focusPosition"]; stale || got.Meta.Settings["iso"] != iso {
+		t.Fatalf("reset changed wrong groups: %+v", got.Meta.Settings)
+	}
+	if _, err = sess.Command(ctx, protocol.Message{Camera: "nonexistent"}); err == nil {
+		t.Fatal("unknown lens accepted")
+	}
+	if _, err = sess.Command(ctx, protocol.Message{Controls: &protocol.Controls{ExposureMode: "manual", ISO: &iso}}); err == nil {
+		t.Fatal("incomplete exposure accepted")
+	}
+	if _, err = sess.Command(ctx, protocol.Message{Controls: &protocol.Controls{ExposureCompensation: &zero}}); err == nil {
+		t.Fatal("EV-only patch accepted while manual exposure was active")
+	}
+	got, err = sess.Cameras(ctx)
+	if err != nil || got.Meta.Settings["iso"] != iso || got.Meta.Settings["exposureCompensation"] != nil {
+		t.Fatalf("rejected EV patch changed settings: %+v %v", got.Meta.Settings, err)
+	}
+	got, err = sess.Command(ctx, protocol.Message{Controls: &protocol.Controls{ExposureMode: "auto", ExposureCompensation: &zero}})
+	if err != nil || got.Meta.Settings["exposureMode"] != "auto" || got.Meta.Settings["exposureCompensation"] != zero || got.Meta.Settings["iso"] != nil {
+		t.Fatalf("explicit auto exposure did not reset manual settings: %+v %v", got.Meta.Settings, err)
+	}
+}

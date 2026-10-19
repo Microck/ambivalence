@@ -33,12 +33,12 @@ phone
 echo "2. phone app restarts; agent captures with no code"
 kill "$PHONE"; sleep 0.3
 phone
-"$BIN" capture --hub "$HUB" -o /tmp/amb-e2e-1.jpg 2>/dev/null; jpeg /tmp/amb-e2e-1.jpg
+"$BIN" capture --hub "$HUB" -o $XDG_CONFIG_HOME/amb-e2e-1.jpg 2>/dev/null; jpeg $XDG_CONFIG_HOME/amb-e2e-1.jpg
 
 echo "3. agent asks first, phone opens 2s later"
 kill "$PHONE"; sleep 0.3
-"$BIN" capture --hub "$HUB" -o /tmp/amb-e2e-2.jpg 2>/dev/null & CAP=$!
+"$BIN" capture --hub "$HUB" -o $XDG_CONFIG_HOME/amb-e2e-2.jpg 2>/dev/null & CAP=$!
 sleep 2; phone
-wait "$CAP"; jpeg /tmp/amb-e2e-2.jpg
-rm -f /tmp/amb-e2e-*.jpg
+wait "$CAP"; jpeg $XDG_CONFIG_HOME/amb-e2e-2.jpg
+rm -f $XDG_CONFIG_HOME/amb-e2e-*.jpg
 echo e2e-fake ok

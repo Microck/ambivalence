@@ -294,7 +294,8 @@ actor HubConnection {
             case "command":
                 let cam = (inner["camera"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                 reply = try await camera.command(camera: cam, torchOn: inner["torchOn"] as? Bool,
-                                                 zoom: (inner["zoomLevel"] as? NSNumber)?.doubleValue)
+                                                 zoom: (inner["zoomLevel"] as? NSNumber)?.doubleValue,
+ controls: inner["controls"] as? [String: Any])
             case "capture":
                 let q = (inner["quality"] as? NSNumber)?.intValue ?? 0, w = (inner["maxWidth"] as? NSNumber)?.intValue ?? 0
                 (reply, jpeg) = try await camera.capture(quality: q > 0 ? q : 80, maxWidth: w > 0 ? w : 1280)

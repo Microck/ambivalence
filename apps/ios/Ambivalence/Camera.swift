@@ -28,11 +28,12 @@ final class Camera: NSObject, @unchecked Sendable {
     func cameras() async throws -> [String: Any] {
         try await exclusive {
             let found = AVCaptureDevice.DiscoverySession(
-                deviceTypes: [.builtInWideAngleCamera], mediaType: .video, position: .unspecified
+                deviceTypes: [.builtInWideAngleCamera, .builtInUltraWideCamera, .builtInTelephotoCamera], mediaType: .video, position: .unspecified
             ).devices
             var reply = self.state(type: "cameras")
             reply["cameras"] = found.map { d -> [String: Any] in
-                ["id": self.name(d.position), "facing": self.name(d.position), "torch": d.hasTorch,
+                ["id": d.uniqueID, "label": d.localizedName, "facing": self.name(d.position), "torch": d.hasTorch,
+                 "capabilities": self.capabilities(d),
                  "minZoom": Double(d.minAvailableVideoZoomFactor), "maxZoom": Double(d.maxAvailableVideoZoomFactor)]
             }
             reply["host"] = ["name": "ios", "platform": "ios"]
@@ -41,20 +42,15 @@ final class Camera: NSObject, @unchecked Sendable {
     }
 
     /// Applies a command (camera, torchOn, zoomLevel) and returns the resulting status.
-    func command(camera: String?, torchOn: Bool?, zoom: Double?) async throws -> [String: Any] {
+    func command(camera: String?, torchOn: Bool?, zoom: Double?, controls: [String: Any]? = nil) async throws -> [String: Any] {
         try await exclusive {
             if let camera {
-                let pos: AVCaptureDevice.Position
-                switch camera {
-                case "front", "user": pos = .front
-                case "back", "environment": pos = .back
-                default: throw LinkError("unknown camera \(camera) (want front or back)")
-                }
-                if pos != self.position || self.input == nil, let err = self.bind(pos) { throw LinkError("switch failed: \(err)") }
+                if let err = self.select(camera) { throw LinkError(err) }
             }
             guard let device = self.input?.device else { throw LinkError("camera not ready") }
             if let torchOn, let err = self.setTorch(device, on: torchOn) { throw LinkError("torch failed: \(err)") }
             if let zoom, let err = self.setZoom(device, zoom) { throw LinkError(err) }
+            if let controls { try self.configure(device, controls) }
             self.publishTorch()
             return self.state(type: "status")
         }
@@ -68,6 +64,8 @@ final class Camera: NSObject, @unchecked Sendable {
                 queue.async {
                     guard self.input != nil, self.session.isRunning else { return cont.resume(throwing: LinkError("camera not ready")) }
                     let settings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])
+                    // Computational quality processing may override custom exposure values.
+                    if self.input?.device.exposureMode == .custom { settings.photoQualityPrioritization = .speed }
                     if let conn = self.photo.connection(with: .video), conn.isVideoRotationAngleSupported(90) {
                         conn.videoRotationAngle = 90 // portrait, matching how the phone is held
                     }
@@ -125,6 +123,12 @@ final class Camera: NSObject, @unchecked Sendable {
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: pos) else {
             return "no \(name(pos)) camera"
         }
+        return bindDevice(device)
+    }
+
+    private func bindDevice(_ device: AVCaptureDevice) -> String? {
+        if input?.device.uniqueID == device.uniqueID { return nil }
+        let pos = device.position
         let newInput: AVCaptureDeviceInput
         do { newInput = try AVCaptureDeviceInput(device: device) } catch { return error.localizedDescription }
         session.beginConfiguration()
@@ -138,6 +142,16 @@ final class Camera: NSObject, @unchecked Sendable {
         session.addInput(newInput)
         if !session.outputs.contains(photo), session.canAddOutput(photo) { session.addOutput(photo) }
         input = newInput
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
+            if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+            if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
+            device.setExposureTargetBias(0, completionHandler: nil)
+            device.videoZoomFactor = max(device.minAvailableVideoZoomFactor, min(1, device.maxAvailableVideoZoomFactor))
+            if device.hasTorch { device.torchMode = .off }
+        } catch { return error.localizedDescription }
         return nil
     }
 
@@ -185,9 +199,101 @@ final class Camera: NSObject, @unchecked Sendable {
     private func state(type: String) -> [String: Any] {
         let d = input?.device
         return [
-            "type": type, "facing": name(position), "cameraId": name(position),
+            "type": type, "facing": name(position), "cameraId": d?.uniqueID ?? "",
             "torch": d?.torchMode == .on, "zoom": Double(d?.videoZoomFactor ?? 1), "connected": true,
+            "capabilities": d.map { capabilities($0) } ?? [:],
+            "settings": d.map { settings($0) } ?? [:],
         ]
+    }
+
+    private func select(_ id: String) -> String? {
+        if ["front", "user", "back", "environment"].contains(id) {
+            let p: AVCaptureDevice.Position = (id == "front" || id == "user") ? .front : .back
+            return bind(p)
+        }
+        let devices = AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera, .builtInUltraWideCamera, .builtInTelephotoCamera], mediaType: .video, position: .unspecified).devices
+        guard let d = devices.first(where: { $0.uniqueID == id }) else { return "unknown camera \(id)" }
+        return bindDevice(d)
+    }
+
+    private func capabilities(_ d: AVCaptureDevice) -> [String: Any] {
+        let f = d.activeFormat
+        return ["controlsVersion": 1, "focusMode": (d.isFocusModeSupported(.continuousAutoFocus) ? ["auto"] : []) + (d.isLockingFocusWithCustomLensPositionSupported ? ["manual"] : []),
+                "focusPosition": ["min": 0, "max": 1], "focusPoint": d.isFocusPointOfInterestSupported,
+                "exposureMode": (d.isExposureModeSupported(.continuousAutoExposure) ? ["auto"] : []) + (d.isExposureModeSupported(.custom) ? ["manual"] : []),
+                "exposureTime": ["min": CMTimeGetSeconds(f.minExposureDuration), "max": CMTimeGetSeconds(f.maxExposureDuration)],
+                "iso": ["min": f.minISO, "max": f.maxISO],
+                "exposureCompensation": ["min": d.minExposureTargetBias, "max": d.maxExposureTargetBias],
+                "whiteBalanceMode": (d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) ? ["auto"] : []) + (d.isWhiteBalanceModeSupported(.locked) ? ["manual"] : []),
+                "whiteBalanceGains": ["min": 1, "max": d.maxWhiteBalanceGain],
+                "whiteBalanceTemperature": ["min": 1000, "max": 15000]]
+    }
+
+    private func settings(_ d: AVCaptureDevice) -> [String: Any] {
+        let g = d.deviceWhiteBalanceGains
+        return ["focusMode": d.focusMode == .locked ? "manual" : "auto", "focusPosition": 1 - d.lensPosition,
+                "exposureMode": d.exposureMode == .custom ? "manual" : "auto", "exposureTime": CMTimeGetSeconds(d.exposureDuration),
+                "iso": d.iso, "exposureCompensation": d.exposureTargetBias,
+                "whiteBalanceMode": d.whiteBalanceMode == .locked ? "manual" : "auto",
+                "whiteBalanceGains": ["red": g.redGain, "green": g.greenGain, "blue": g.blueGain]]
+    }
+
+    // Validate the whole request before applying any control group. Values are never clamped.
+    private func configure(_ d: AVCaptureDevice, _ c: [String: Any]) throws {
+        let known: Set<String> = ["focusMode", "focusPosition", "focusPoint", "exposureMode", "exposureTime", "iso", "exposureCompensation", "whiteBalanceMode", "whiteBalanceGains", "whiteBalanceTemperature"]
+        guard Set(c.keys).isSubset(of: known) else { throw LinkError("unknown control") }
+        func number(_ key: String, _ lo: Double, _ hi: Double) throws -> Double? {
+            guard let raw = c[key] else { return nil }
+            guard let n = raw as? NSNumber, n.doubleValue.isFinite, n.doubleValue >= lo, n.doubleValue <= hi else { throw LinkError("\(key) out of range \(lo)-\(hi)") }
+            return n.doubleValue
+        }
+        for key in ["focusMode", "exposureMode", "whiteBalanceMode"] {
+            if let v = c[key], !(v is String && ["auto", "manual"].contains(v as! String)) { throw LinkError("invalid \(key)") }
+        }
+        let fm = c["focusMode"] as? String, em = c["exposureMode"] as? String, wm = c["whiteBalanceMode"] as? String
+        let fp = try number("focusPosition", 0, 1)
+        guard (fm == "manual") == (fp != nil) else { throw LinkError("manual focus requires focusPosition") }
+        if fm == "manual" && !d.isLockingFocusWithCustomLensPositionSupported { throw LinkError("manual focus unsupported") }
+        if fm == "auto" && !d.isFocusModeSupported(.continuousAutoFocus) { throw LinkError("autofocus unsupported") }
+        var point: CGPoint?
+        if let raw = c["focusPoint"] {
+            guard fm == "auto", d.isFocusPointOfInterestSupported, let p = raw as? [String: NSNumber],
+                  let x = p["x"]?.doubleValue, let y = p["y"]?.doubleValue, x.isFinite, y.isFinite, (0...1).contains(x), (0...1).contains(y) else { throw LinkError("focusPoint unsupported or invalid") }
+            point = CGPoint(x: x, y: y)
+        }
+        let t = try number("exposureTime", CMTimeGetSeconds(d.activeFormat.minExposureDuration), CMTimeGetSeconds(d.activeFormat.maxExposureDuration))
+        let iso = try number("iso", Double(d.activeFormat.minISO), Double(d.activeFormat.maxISO))
+        let ev = try number("exposureCompensation", Double(d.minExposureTargetBias), Double(d.maxExposureTargetBias))
+        if em == "manual" {
+            guard t != nil, iso != nil, ev == nil, d.isExposureModeSupported(.custom) else { throw LinkError("manual exposure requires supported shutter and ISO without EV bias") }
+        } else if t != nil || iso != nil { throw LinkError("shutter and ISO require manual exposure") }
+        if ev != nil && em != "auto" && d.exposureMode == .custom { throw LinkError("EV bias requires auto exposure") }
+        if em == "auto" && !d.isExposureModeSupported(.continuousAutoExposure) { throw LinkError("auto exposure unsupported") }
+        let temp = try number("whiteBalanceTemperature", 1000, 15000)
+        var gains: AVCaptureDevice.WhiteBalanceGains?
+        if let raw = c["whiteBalanceGains"] {
+            guard let g = raw as? [String: NSNumber], let r = g["red"], let green = g["green"], let b = g["blue"] else { throw LinkError("invalid RGB gains") }
+            gains = AVCaptureDevice.WhiteBalanceGains(redGain: r.floatValue, greenGain: green.floatValue, blueGain: b.floatValue)
+        }
+        if let temp { gains = d.deviceWhiteBalanceGains(for: .init(temperature: Float(temp), tint: 0)) }
+        if wm == "manual" {
+            guard (c["whiteBalanceGains"] != nil) != (temp != nil), d.isWhiteBalanceModeSupported(.locked), let g = gains,
+                  [g.redGain, g.greenGain, g.blueGain].allSatisfy({ $0.isFinite && $0 >= 1 && $0 <= d.maxWhiteBalanceGain }) else { throw LinkError("unsupported white balance or gains out of range") }
+        } else if gains != nil { throw LinkError("gains/temperature require manual white balance") }
+        if wm == "auto" && !d.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { throw LinkError("auto white balance unsupported") }
+        try d.lockForConfiguration()
+        let applied = DispatchGroup()
+        // AVFoundation runs nearest-to-farthest, opposite to the wire's focus position.
+        if let fp { applied.enter(); d.setFocusModeLocked(lensPosition: Float(1 - fp)) { _ in applied.leave() } }
+        if fm == "auto" { if let point { d.focusPointOfInterest = point }; d.focusMode = .continuousAutoFocus }
+        if let t, let iso { applied.enter(); d.setExposureModeCustom(duration: CMTime(seconds: t, preferredTimescale: 1_000_000_000), iso: Float(iso)) { _ in applied.leave() } }
+        if em == "auto" { d.exposureMode = .continuousAutoExposure }
+        // Replacing the exposure group clears an earlier EV bias in either mode.
+        if let bias = ev ?? (em != nil ? 0 : nil) { applied.enter(); d.setExposureTargetBias(Float(bias)) { _ in applied.leave() } }
+        if let gains { applied.enter(); d.setWhiteBalanceModeLocked(with: gains) { _ in applied.leave() } }
+        if wm == "auto" { d.whiteBalanceMode = .continuousAutoWhiteBalance }
+        d.unlockForConfiguration()
+        guard applied.wait(timeout: .now() + 8) == .success else { throw LinkError("camera control timed out; query status before retrying") }
     }
 
     private func publishTorch() {

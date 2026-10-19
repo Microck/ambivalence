@@ -95,7 +95,7 @@ func Run(ctx context.Context, opt Options) error {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "camera_list",
-		Description: "List cameras on the paired host (front/back, torch, zoom range).",
+		Description: "List selectable camera/lens IDs, labels, zoom ranges and manual control capabilities.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, Title: "List cameras"},
 	}, s.cameraList)
 
@@ -117,6 +117,7 @@ func Run(ctx context.Context, opt Options) error {
 		Annotations: &mcp.ToolAnnotations{Title: "Zoom"},
 	}, s.cameraZoom)
 
+	mcp.AddTool(server, &mcp.Tool{Name: "camera_configure", Description: "Configure focus, shutter duration/ISO, EV bias and white balance. Call camera_list first for supported controls/ranges. Switch lenses separately; omitted control groups stay unchanged. Unsupported settings return errors."}, s.cameraConfigure)
 	log.Printf("mcp stdio hub=%s", s.hubURL)
 	return server.Run(ctx, &mcp.StdioTransport{})
 }
@@ -166,6 +167,9 @@ func (s *Server) cameraStatus(ctx context.Context, _ *mcp.CallToolRequest, _ emp
 		out["facing"] = st.Facing
 		out["torch"] = st.Torch
 		out["zoom"] = st.Zoom
+		out["cameraId"] = st.CameraID
+		out["settings"] = st.Settings
+		out["capabilities"] = st.Capabilities
 		if st.Host != nil {
 			out["host"] = st.Host
 		}
@@ -280,7 +284,7 @@ func (s *Server) cameraCapture(ctx context.Context, _ *mcp.CallToolRequest, args
 			&mcp.ImageContent{Data: fr.JPEG, MIMEType: "image/jpeg"},
 			&mcp.TextContent{Text: meta},
 		},
-	}, map[string]any{"width": fr.Meta.Width, "height": fr.Meta.Height, "facing": fr.Meta.Facing, "torch": fr.Meta.Torch, "bytes": len(fr.JPEG)}, nil
+	}, map[string]any{"width": fr.Meta.Width, "height": fr.Meta.Height, "facing": fr.Meta.Facing, "torch": fr.Meta.Torch, "bytes": len(fr.JPEG), "cameraId": fr.Meta.CameraID, "settings": fr.Meta.Settings}, nil
 }
 
 func (s *Server) cameraList(ctx context.Context, _ *mcp.CallToolRequest, _ emptyArgs) (*mcp.CallToolResult, any, error) {
@@ -389,4 +393,11 @@ func rewriteLocal(addr string) string {
 
 func init() {
 	log.SetOutput(os.Stderr)
+}
+
+func (s *Server) cameraConfigure(ctx context.Context, _ *mcp.CallToolRequest, args protocol.Controls) (*mcp.CallToolResult, any, error) {
+	if err := args.Validate(); err != nil {
+		return errResult(err), nil, nil
+	}
+	return s.command(ctx, protocol.Message{Controls: &args})
 }

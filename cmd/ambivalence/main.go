@@ -64,6 +64,8 @@ func main() {
 		err = cmdTorch(args)
 	case "switch":
 		err = cmdSwitch(args)
+	case "configure":
+		err = cmdConfigure(args)
 	case "zoom":
 		err = cmdZoom(args)
 	case "host":
@@ -93,7 +95,8 @@ COMMANDS
   status       print pairing / camera state
   cameras      list cameras on the host
   torch on|off
-  switch front|back
+  switch front|back|CAMERA_ID
+  configure JSON  set manual controls (see docs/camera-controls.md)
   zoom FACTOR
   host fake    test-pattern camera host (no phone)
   version
@@ -259,6 +262,9 @@ func cmdStatus(args []string) error {
 				out["online"] = true
 				out["cameras"] = fr.Meta.Cameras
 				out["facing"] = fr.Meta.Facing
+				out["cameraId"] = fr.Meta.CameraID
+				out["settings"] = fr.Meta.Settings
+				out["capabilities"] = fr.Meta.Capabilities
 				out["torch"] = fr.Meta.Torch
 				out["host"] = fr.Meta.Host
 			} else {
@@ -300,7 +306,7 @@ func cmdTorch(args []string) error {
 
 func cmdSwitch(args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: ambivalence switch front|back")
+		return fmt.Errorf("usage: ambivalence switch front|back|CAMERA_ID")
 	}
 	return runCommand(args[1:], protocol.Message{Camera: args[0]}, func(st protocol.Message) {
 		fmt.Printf("camera=%s facing=%s\n", st.CameraID, st.Facing)
@@ -427,4 +433,20 @@ func runTunnel(ctx context.Context, listen string) {
 	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
 		log.Printf("tunnel: %v", err)
 	}
+}
+
+func cmdConfigure(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: ambivalence configure '{\"focusMode\":\"auto\"}'")
+	}
+	var controls protocol.Controls
+	dec := json.NewDecoder(strings.NewReader(args[0]))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&controls); err != nil {
+		return err
+	}
+	if err := controls.Validate(); err != nil {
+		return err
+	}
+	return runCommand(args[1:], protocol.Message{Controls: &controls}, func(st protocol.Message) { b, _ := json.MarshalIndent(st, "", "  "); fmt.Println(string(b)) })
 }

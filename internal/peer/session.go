@@ -192,6 +192,19 @@ func (s *Session) Capture(ctx context.Context, quality, maxWidth int) (Frame, er
 }
 
 func (s *Session) Command(ctx context.Context, msg protocol.Message) (Frame, error) {
+	if msg.Controls != nil {
+		if err := msg.Controls.Validate(); err != nil {
+			return Frame{}, err
+		}
+		// Older hosts silently ignore unknown fields: require capability negotiation.
+		info, err := s.Cameras(ctx)
+		if err != nil {
+			return Frame{}, err
+		}
+		if info.Meta.Capabilities["controlsVersion"] != float64(1) {
+			return Frame{}, fmt.Errorf("host does not support manual controls; update the phone app")
+		}
+	}
 	msg.Type = protocol.TypeCommand
 	return s.call(ctx, msg)
 }
