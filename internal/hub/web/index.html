@@ -132,7 +132,7 @@
   const unb64 = (s) => Uint8Array.from(atob(s || ""), c => c.charCodeAt(0));
 
   let code = "------";
-  let ws, stream, facing = "environment", torchOn = false, zoomLevel = 1;
+  let ws, stream, cameraSelection = null, facing = "environment", torchOn = false, zoomLevel = 1;
   // Per-agent state, reset when an agent arrives or leaves. seal is set once the agent proved
   // the link; only requests sealed under it may touch the camera.
   let agentHere = false, seal = null, challenge = null, pairing = null, squatTimer = null;
@@ -156,10 +156,19 @@
     if (!navigator.mediaDevices || !window.isSecureContext) {
       throw new Error("the camera needs HTTPS. Open the https:// tunnel URL printed by `ambivalence hub --tunnel`");
     }
+    const selection = deviceId || facing;
+    const active = stream?.getVideoTracks()[0];
+    // Keep the selector used for this live stream: browsers may hide facingMode,
+    // so its settings alone cannot identify a repeated default-camera request.
+    if (active?.readyState === "live" && (deviceId ? active.getSettings().deviceId === deviceId : cameraSelection === selection)) {
+      facing = active.getSettings().facingMode || "unknown";
+      return;
+    }
     if (stream) stream.getTracks().forEach(t => t.stop());
     // Mobile cameras may require releasing the old stream before opening another.
     // If acquisition fails, keep no stopped stream that could return a frozen JPEG.
     stream = null;
+    cameraSelection = null;
     video.srcObject = null;
     setTorch(false);
     zoomLevel = 1;
@@ -167,6 +176,7 @@
       audio: false, video: { ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: facing } }), width: { ideal: 1920 }, height: { ideal: 1080 } }
     });
     video.srcObject = stream;
+    cameraSelection = selection;
     const actualFacing = stream.getVideoTracks()[0].getSettings().facingMode;
     facing = actualFacing || "unknown";
     await video.play();
@@ -443,7 +453,11 @@
 
   $("connect").onclick = connect;
   hubEl.onkeydown = (e) => { if (e.key === "Enter") connect(); };
-  $("flip").onclick = async () => { facing = facing === "environment" ? "user" : "environment"; try { await startCamera(); } catch (e) { setStatus(e.message); } };
+  $("flip").onclick = async () => {
+    const current = facing === "unknown" ? cameraSelection : facing;
+    facing = current === "environment" ? "user" : "environment";
+    try { await startCamera(); } catch (e) { setStatus(e.message); }
+  };
   torchBtn.onclick = () => applyTorch(!torchOn).catch(e => setStatus(e.message));
   startCamera().then(connect).catch(e => setStatus(e.message));
 })();

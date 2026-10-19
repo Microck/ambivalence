@@ -139,7 +139,11 @@ def manual_controls(base: str) -> None:
         if "manual" in caps.get("exposureMode", []):
             shutter = max(caps["exposureTime"]["min"], min(0.008, caps["exposureTime"]["max"]))
             iso = math.ceil(max(caps["iso"]["min"], min(100, caps["iso"]["max"])))
+            if "exposureCompensation" in caps:
+                bias = max(caps["exposureCompensation"]["min"], min(1, caps["exposureCompensation"]["max"]))
+                configure(exposureMode="auto", exposureCompensation=bias)
             settings = configure(exposureMode="manual", exposureTime=shutter, iso=iso)
+            assert abs(settings.get("exposureCompensation", 0)) < 0.01, settings
             assert abs(settings["exposureTime"] - shutter) <= max(shutter * 0.02, 1e-6), settings
             assert abs(settings["iso"] - iso) <= max(iso * 0.02, 1), settings
             if focus:

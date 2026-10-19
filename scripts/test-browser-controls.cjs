@@ -101,7 +101,8 @@ test('lens selection requests an exact device ID; aliases use facing hints', asy
 });
 test('failed camera acquisition clears the stopped stream and rejects frozen captures', async () => {
   let stopped = false;
-  const stream = { getTracks: () => [{ stop: () => { stopped = true; } }] };
+  const track = { readyState: 'live', getSettings: () => ({ deviceId: 'old-camera' }), stop: () => { stopped = true; } };
+  const stream = { getTracks: () => [track], getVideoTracks: () => [track] };
   const context = vm.createContext({ navigator: { mediaDevices: { getUserMedia: async () => { throw new Error('camera unavailable'); } } },
     window: { isSecureContext: true }, stream, facing: 'environment', video: { srcObject: stream, videoWidth: 1920, videoHeight: 1080 },
     setTorch: () => {}, zoomLevel: 2 });
@@ -113,4 +114,34 @@ test('failed camera acquisition clears the stopped stream and rejects frozen cap
   assert.equal(context.video.srcObject, null);
   assert.equal(context.zoomLevel, 1);
   await assert.rejects(context.captureJpeg(80, 320), /camera not ready/);
+});
+test('repeated active device and default selector keep the live stream and controls', async () => {
+  let opens = 0, stops = 0, constraints;
+  const flip = {};
+  const settings = { deviceId: 'back-id', focusMode: 'manual', focusDistance: 10 };
+  const track = { readyState: 'live', getSettings: () => settings, stop: () => { stops++; } };
+  const stream = { getTracks: () => [track], getVideoTracks: () => [track] };
+  const context = vm.createContext({ navigator: { mediaDevices: { getUserMedia: async c => { opens++; constraints = c; return stream; } } },
+    window: { isSecureContext: true }, stream, cameraSelection: 'environment', facing: 'environment',
+    video: { srcObject: stream, play: async () => {} }, setTorch: () => {}, zoomLevel: 2, $: () => flip });
+  vm.runInContext(html.slice(html.indexOf('  async function startCamera'), html.indexOf('  async function applyTorch')), context);
+  await context.startCamera();
+  await context.startCamera('back-id');
+  assert.equal(opens, 0);
+  assert.equal(stops, 0);
+  assert.equal(context.zoomLevel, 2);
+  assert.equal(context.stream, stream);
+  assert.equal(settings.focusMode, 'manual');
+  // An alias after selecting another exact device must still select the default.
+  context.cameraSelection = 'tele-id';
+  context.facing = 'environment';
+  await context.startCamera();
+  assert.equal(opens, 1);
+  assert.equal(stops, 1);
+  // The flip button can use that selector even when facingMode is hidden.
+  vm.runInContext(html.slice(html.indexOf('  $("flip").onclick'), html.indexOf('  torchBtn.onclick')), context);
+  await flip.onclick();
+  assert.equal(opens, 2);
+  assert.equal(stops, 2);
+  assert.equal(constraints.video.facingMode.ideal, 'user');
 });
