@@ -33,7 +33,7 @@ final class Camera: NSObject, @unchecked Sendable {
             var reply = self.state(type: "cameras")
             reply["cameras"] = found.map { d -> [String: Any] in
                 ["id": d.uniqueID, "label": d.localizedName, "facing": self.name(d.position), "torch": d.hasTorch,
- "capabilities": self.capabilities(d),
+                 "capabilities": self.capabilities(d),
                  "minZoom": Double(d.minAvailableVideoZoomFactor), "maxZoom": Double(d.maxAvailableVideoZoomFactor)]
             }
             reply["host"] = ["name": "ios", "platform": "ios"]
@@ -190,8 +190,8 @@ final class Camera: NSObject, @unchecked Sendable {
         return [
             "type": type, "facing": name(position), "cameraId": d?.uniqueID ?? "",
             "torch": d?.torchMode == .on, "zoom": Double(d?.videoZoomFactor ?? 1), "connected": true,
- "capabilities": d.map { capabilities($0) } ?? [:],
- "settings": d.map { settings($0) } ?? [:],
+            "capabilities": d.map { capabilities($0) } ?? [:],
+            "settings": d.map { settings($0) } ?? [:],
         ]
     }
 
