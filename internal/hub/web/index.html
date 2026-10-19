@@ -438,27 +438,30 @@
     let parsed;
     try {
       parsed = new URL(url);
-      if (!parsed.hostname || parsed.username || parsed.password || parsed.hash) throw new Error("invalid URL");
+      if (!parsed.hostname || parsed.username || parsed.password || url.includes("#")) throw new Error("invalid URL");
     } catch {
       return setStatus("invalid hub URL: use ws:// or wss:// with a host, without credentials or a fragment");
     }
     if (ws) try { ws.close(); } catch {}
     setStatus("connecting to " + parsed.host);
     ws = new WebSocket(url);
+    cancelConfirm(); agentHere = false; seal = null; challenge = null; pairing = null;
+    clearTimeout(squatTimer);
+    const mine = ws;
     ws.binaryType = "arraybuffer";
-    ws.onopen = () => send({ type: "hello", role: "host", device: ident.device, host: { name: "web", platform: "web" } });
+    ws.onopen = () => ws === mine && send({ type: "hello", role: "host", device: ident.device, host: { name: "web", platform: "web" } });
     // One message at a time, so sealed sequence checks follow arrival order. "Agent left" is
     // also seen at once, because the queue may be parked on the pairing prompt.
     let inbox = Promise.resolve();
     ws.onmessage = (ev) => {
+      if (ws !== mine) return;
       if (typeof ev.data === "string" && /"type":"(status|welcome)"/.test(ev.data) && !JSON.parse(ev.data).connected) cancelConfirm();
-      inbox = inbox.then(() => onMessage(ev));
+      inbox = inbox.then(() => { if (ws === mine) return onMessage(ev); });
     };
     // Stay linked through network drops: redial this socket's URL until a newer connect() replaces it.
-    const mine = ws;
     ws.onclose = () => {
       if (ws !== mine) return;
-      cancelConfirm(); agentHere = false; seal = null;
+      cancelConfirm(); agentHere = false; seal = null; challenge = null; pairing = null; clearTimeout(squatTimer);
       setStatus("disconnected, reconnecting");
       setTimeout(() => { if (ws === mine) connect(); }, 3000);
     };

@@ -158,7 +158,7 @@ test('repeated active device and default selector keep the live stream and contr
 
 test('invalid hub URLs are reported without throwing or closing the current socket', () => {
   const connectSource = html.slice(html.indexOf('  function connect()'), html.indexOf('  $("connect").onclick'));
-  for (const value of ['ws://', 'wss://example.test/#fragment', 'ws://user:pass@example.test/v1']) {
+  for (const value of ['ws://', 'wss://example.test/#fragment', 'ws://example.test/v1#', 'ws://user:pass@example.test/v1']) {
     let status = '', closed = false;
     const context = vm.createContext({ URL, hubEl: { value, blur() {} },
       ws: { close() { closed = true; } }, setStatus(s) { status = s; },
@@ -200,10 +200,24 @@ test('late close from a replaced socket does not reset the current link', () => 
   const context = vm.createContext({ URL, WebSocket: Socket, ws: null,
     hubEl: { value: 'ws://127.0.0.1:17842/v1', blur() {} }, setStatus() {},
     cancelConfirm() { cancelled++; }, agentHere: true, seal: { active: true },
+    clearTimeout() {}, squatTimer: null, challenge: null, pairing: null,
     setTimeout() {}, send() {}, onMessage() {}, ident: { device: 'fixture' } });
   vm.runInContext(html.slice(html.indexOf('  function connect()'), html.indexOf('  $("connect").onclick')), context);
   context.connect(); context.connect();
+  context.agentHere = true; context.seal = {active:true}; cancelled = 0;
   sockets[0].onclose();
   assert.equal(cancelled, 0); assert.equal(context.agentHere, true);
   assert.equal(context.seal.active, true);
+});
+
+test('replacement socket clears the previous peer authentication state', () => {
+  const context = vm.createContext({ URL, WebSocket: class { close() {} },
+    ws: {close() {}}, hubEl: {value:'ws://127.0.0.1:17842/v1',blur() {}},
+    setStatus() {}, cancelConfirm() {}, clearTimeout() {}, setTimeout() {},
+    agentHere:true, seal:{old:true}, challenge:{old:true}, pairing:{old:true}, squatTimer:123,
+    ident:{device:'fixture'}, send() {}, onMessage() {} });
+  vm.runInContext(html.slice(html.indexOf('  function connect()'),html.indexOf('  $("connect").onclick')),context);
+  context.connect();
+  assert.equal(context.agentHere,false);
+  for(const field of ['seal','challenge','pairing']) assert.equal(context[field],null);
 });

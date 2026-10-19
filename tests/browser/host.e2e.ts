@@ -10,7 +10,7 @@ for (const width of [390, 1280]) {
   expect(await browser.evaluate(() => document.documentElement.scrollWidth > innerWidth)).toBe(false);
  });
 }
-for (const value of ["https://example.test", "ws://", "wss://example.test/#fragment", "ws://user:pass@example.test/v1"]) {
+for (const value of ["https://example.test", "ws://", "wss://example.test/#fragment", "ws://example.test/v1#", "ws://user:pass@example.test/v1"]) {
  test(`rejects invalid hub address ${value}`, async ({ app, screen }) => {
   await app.open("/");
   await expect(screen.getByText("camera denied by test fixture")).toBeVisible();
