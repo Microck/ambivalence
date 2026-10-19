@@ -274,6 +274,9 @@
     } else if ("exposureTime" in request || "iso" in request) throw new Error("shutter and ISO require manual mode");
     if ("exposureTime" in request) number("exposureTime", "exposureTime", request.exposureTime * 10000);
     if ("iso" in request) number("iso", "iso", request.iso);
+    // An unconstrained property may keep its current value, so explicitly reset
+    // EV when replacing the exposure group.
+    if (request.exposureMode && !("exposureCompensation" in request) && caps.exposureCompensation) number("exposureCompensation", "exposureCompensation", 0);
     if ("exposureCompensation" in request) {
       if (request.exposureMode !== "auto" && controlSettings().exposureMode === "manual") throw new Error("EV bias requires auto exposure");
       number("exposureCompensation", "exposureCompensation", request.exposureCompensation);

@@ -75,9 +75,19 @@ test('independent groups, torch and zoom retain constraints; auto clears only it
   assert.equal(h.settings.exposureMode, 'continuous');
   assert.equal(h.settings.exposureTime, undefined);
   assert.equal(h.settings.iso, undefined);
+  assert.equal(h.settings.exposureCompensation, 0);
   assert.equal(h.settings.focusMode, 'manual');
   assert.equal(h.settings.whiteBalanceMode, 'manual');
   assert.equal(h.settings.torch, true);
+});
+test('explicit exposure modes clear a prior EV bias', async () => {
+  const h = host();
+  await h.context.applyControls({ exposureMode: 'auto', exposureCompensation: 1 });
+  await h.context.applyControls({ exposureMode: 'manual', exposureTime: 0.01, iso: 100 });
+  assert.equal(h.settings.exposureCompensation, 0);
+  await h.context.applyControls({ exposureMode: 'auto', exposureCompensation: 1 });
+  await h.context.applyControls({ exposureMode: 'auto' });
+  assert.equal(h.settings.exposureCompensation, 0);
 });
 test('ignored advanced constraints return an error', async () => {
   const h = host(true);
