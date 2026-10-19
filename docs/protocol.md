@@ -79,7 +79,11 @@ When a phone reconnects (app restart, network change) the hub closes its old soc
 
 ## command (inner)
 
-`torchOn`, `zoomLevel`, `camera` (`front`/`back`). The phone replies `status` with the same `id` after the hardware change, or `error`.
+`torchOn`, `zoomLevel`, `camera` (`front`/`back` aliases or an exact ID from `cameras`).
+An optional `controls` object carries manual camera settings; see [camera controls](camera-controls.md).
+`cameras`/`status` may include `capabilities` (including `controlsVersion: 1`) and
+`settings`; individual camera entries may include `label` and `capabilities`.
+`frame` includes `cameraId` and `settings` when available. The phone replies `status` with the same `id` after the hardware change, or `error`.
 
 ## local discovery
 

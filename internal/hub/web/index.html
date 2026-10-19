@@ -151,16 +151,19 @@
   hubEl.value = new URLSearchParams(location.search).get("hub") ||
     (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/v1";
 
-  async function startCamera() {
+  async function startCamera(deviceId) {
     // Browsers expose the camera only on HTTPS (or localhost). Say so instead of failing silently.
     if (!navigator.mediaDevices || !window.isSecureContext) {
       throw new Error("the camera needs HTTPS. Open the https:// tunnel URL printed by `ambivalence hub --tunnel`");
     }
     if (stream) stream.getTracks().forEach(t => t.stop());
     stream = await navigator.mediaDevices.getUserMedia({
-      audio: false, video: { facingMode: { ideal: facing }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+      audio: false, video: { ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: facing } }), width: { ideal: 1920 }, height: { ideal: 1080 } }
     });
     video.srcObject = stream;
+    const actualFacing = stream.getVideoTracks()[0].getSettings().facingMode;
+    facing = actualFacing || "unknown";
+    await video.play();
     setTorch(false);
     zoomLevel = 1; // a new stream starts unzoomed
   }
@@ -186,6 +189,77 @@
     zoomLevel = level;
   }
 
+  // Image Capture exposureTime is in 100 microsecond units; the wire uses seconds.
+  function controlCapabilities(track) {
+    const c = track?.getCapabilities?.() || {};
+    const out = { controlsVersion: 1, focusPoint: false };
+    for (const k of ["focusMode", "exposureMode", "whiteBalanceMode"]) {
+      if (c[k]) out[k] = [...new Set(c[k].filter(m => ["manual", "continuous", "single-shot"].includes(m)).map(m => m === "manual" ? m : "auto"))];
+    }
+    for (const k of ["exposureTime", "iso", "exposureCompensation"]) {
+      if (c[k]) out[k] = { ...c[k], min: c[k].min * (k === "exposureTime" ? 0.0001 : 1), max: c[k].max * (k === "exposureTime" ? 0.0001 : 1), step: c[k].step * (k === "exposureTime" ? 0.0001 : 1) };
+    }
+    if (c.focusDistance && c.focusDistance.max > c.focusDistance.min) out.focusPosition = { min: 0, max: 1 };
+    if (c.colorTemperature) out.whiteBalanceTemperature = c.colorTemperature;
+    return out;
+  }
+  function controlSettings() {
+    const track = stream?.getVideoTracks()[0], s = track?.getSettings() || {}, c = track?.getCapabilities?.() || {};
+    const out = {};
+    for (const k of ["focusMode", "exposureMode", "whiteBalanceMode"]) if (s[k]) out[k] = s[k] === "manual" ? "manual" : "auto";
+    for (const k of ["exposureTime", "iso", "exposureCompensation"]) if (s[k] !== undefined) out[k] = s[k] * (k === "exposureTime" ? 0.0001 : 1);
+    if (s.colorTemperature !== undefined) out.whiteBalanceTemperature = s.colorTemperature;
+    if (s.focusDistance !== undefined && c.focusDistance?.max > c.focusDistance?.min) out.focusPosition = (c.focusDistance.max - s.focusDistance) / (c.focusDistance.max - c.focusDistance.min);
+    return out;
+  }
+  async function applyControls(request) {
+    const track = stream?.getVideoTracks()[0];
+    if (!track) throw new Error("camera not ready");
+    const caps = track.getCapabilities?.() || {}, changes = {};
+    const allowed = ["focusMode", "focusPosition", "focusPoint", "exposureMode", "exposureTime", "iso", "exposureCompensation", "whiteBalanceMode", "whiteBalanceGains", "whiteBalanceTemperature"];
+    for (const key of Object.keys(request)) if (!allowed.includes(key)) throw new Error("unknown control " + key);
+    for (const key of ["focusPoint", "whiteBalanceGains"]) if (key in request) throw new Error(key + " unsupported by browser host");
+    const mode = (key) => {
+      if (!(key in request)) return;
+      const value = request[key];
+      if (!["auto", "manual"].includes(value)) throw new Error("invalid " + key);
+      const actual = value === "manual" ? "manual" : caps[key]?.includes("continuous") ? "continuous" : "single-shot";
+      if (!caps[key]?.includes(actual)) throw new Error(key + " unsupported");
+      changes[key] = actual;
+    };
+    ["focusMode", "exposureMode", "whiteBalanceMode"].forEach(mode);
+    const number = (key, target, value) => {
+      const range = caps[target];
+      if (!range || !Number.isFinite(value) || value < range.min || value > range.max) throw new Error(key + " unsupported or out of range");
+      changes[target] = value;
+    };
+    if ((request.focusMode === "manual") !== ("focusPosition" in request)) throw new Error("manual focus requires focusPosition");
+    if ("focusPosition" in request) {
+      const p = request.focusPosition, r = caps.focusDistance;
+      if (!Number.isFinite(p) || p < 0 || p > 1 || !r || r.max <= r.min) throw new Error("invalid or unsupported focus position");
+      number("focusPosition", "focusDistance", Math.max(r.min, Math.min(r.max, r.max - p * (r.max - r.min))));
+    }
+    if (request.exposureMode === "manual") {
+      if (!("exposureTime" in request) || !("iso" in request) || "exposureCompensation" in request) throw new Error("manual exposure requires shutter and ISO without EV bias");
+    } else if ("exposureTime" in request || "iso" in request) throw new Error("shutter and ISO require manual mode");
+    if ("exposureTime" in request) number("exposureTime", "exposureTime", request.exposureTime * 10000);
+    if ("iso" in request) number("iso", "iso", request.iso);
+    if ("exposureCompensation" in request) {
+      if (request.exposureMode !== "auto" && controlSettings().exposureMode === "manual") throw new Error("EV bias requires auto exposure");
+      number("exposureCompensation", "exposureCompensation", request.exposureCompensation);
+    }
+    if ((request.whiteBalanceMode === "manual") !== ("whiteBalanceTemperature" in request)) throw new Error("manual white balance requires temperature");
+    if ("whiteBalanceTemperature" in request) number("whiteBalanceTemperature", "colorTemperature", request.whiteBalanceTemperature);
+    // Advanced constraints are necessary for Image Capture extensions. Verify settings
+    // afterwards: browsers are allowed to ignore an unsupported advanced constraint.
+    await track.applyConstraints({ advanced: [changes] });
+    const actual = track.getSettings();
+    for (const [key, value] of Object.entries(changes)) {
+      const tolerance = Math.max(caps[key]?.step || 0, typeof value === "number" ? Math.abs(value) * 0.01 : 0, 1e-6);
+      if (typeof value === "number" ? !Number.isFinite(actual[key]) || Math.abs(actual[key] - value) > tolerance : actual[key] !== value) throw new Error(key + " was not applied by the browser");
+    }
+  }
+
   function captureJpeg(quality, maxWidth) {
     let w = video.videoWidth, h = video.videoHeight;
     if (!w) return Promise.reject(new Error("camera not ready"));
@@ -197,8 +271,8 @@
   }
 
   const send = (o) => { o.v = 1; ws.send(JSON.stringify(o)); };
-  const side = () => facing === "user" ? "front" : "back";
-  const state = (id, type) => ({ type, id, facing: side(), cameraId: side(), torch: torchOn, zoom: zoomLevel, connected: true });
+  const side = () => facing === "user" ? "front" : facing === "environment" ? "back" : "unknown";
+  const state = (id, type) => ({ type, id, facing: side(), cameraId: stream?.getVideoTracks()[0].getSettings().deviceId || "", capabilities: controlCapabilities(stream?.getVideoTracks()[0]), settings: controlSettings(), torch: torchOn, zoom: zoomLevel, connected: true });
 
   // Replies to a sealed request go back sealed; a frame's JPEG follows as its own sealed box.
   function sendSealed(s, obj, buf) {
@@ -264,24 +338,35 @@
     }
   }
 
-  async function camera(s, m) {
+  let cameraTurn = Promise.resolve();
+  function camera(s, m) {
+    const next = cameraTurn.then(() => serveCamera(s, m));
+    cameraTurn = next.catch(() => {});
+    return next;
+  }
+  async function serveCamera(s, m) {
     switch (m.type) {
       case "cameras": {
         const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput");
         const track = stream && stream.getVideoTracks()[0];
         const torch = !!(track && track.getCapabilities && track.getCapabilities().torch);
         return sendSealed(s, { ...state(m.id, "cameras"), host: { name: "web", platform: "web" },
-          cameras: devs.map((d, i) => ({ id: d.deviceId || String(i), facing: /front|user/i.test(d.label) ? "front" : "back", torch: false, minZoom: 1, maxZoom: 1 }))
-            .map(c => c.facing === side() ? { ...c, torch, minZoom: zoomRange().min, maxZoom: zoomRange().max } : c) });
+          cameras: devs.map(d => ({ id: d.deviceId, label: d.label, facing: "unknown", torch: false, minZoom: 1, maxZoom: 1,
+            ...(d.deviceId === track?.getSettings().deviceId ? { facing: side(), torch, minZoom: zoomRange().min, maxZoom: zoomRange().max, capabilities: controlCapabilities(track) } : {}) })) });
       }
       case "command":
         if (m.camera) {
           const want = m.camera === "front" || m.camera === "user" ? "user" : m.camera === "back" || m.camera === "environment" ? "environment" : null;
-          if (!want) throw new Error("unknown camera " + m.camera + " (want front or back)");
-          if (want !== facing) { facing = want; await startCamera(); }
+          if (want) { facing = want; await startCamera(); }
+          else {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            if (!devices.some(d => d.kind === "videoinput" && d.deviceId === m.camera)) throw new Error("unknown camera " + m.camera);
+            await startCamera(m.camera);
+          }
         }
         if (typeof m.torchOn === "boolean") await applyTorch(m.torchOn);
         if (typeof m.zoomLevel === "number") await applyZoom(m.zoomLevel);
+        if (m.controls) await applyControls(m.controls);
         return sendSealed(s, state(m.id, "status"));
       case "capture": {
         const { b, w, h } = await captureJpeg(m.quality, m.maxWidth);

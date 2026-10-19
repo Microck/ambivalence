@@ -8,6 +8,12 @@ import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.media.ExifInterface
 import android.os.Bundle
+import android.os.Build
+import android.hardware.camera2.CameraManager
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2CameraControl
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import android.view.Surface
 import android.view.View
 import android.view.inputmethod.EditorInfo
@@ -37,6 +43,7 @@ import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 
+@androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
 class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
     private lateinit var preview: PreviewView
     private lateinit var pairCode: TextView
@@ -57,6 +64,8 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
     private var lensFacing = CameraSelector.LENS_FACING_BACK
     private var torchOn = false
     private var zoom = 1.0
+    private var selectedId = ""
+    private var configured = JSONObject()
 
     // Agents on different hubs share one camera: one request at a time, in arrival order.
     private val cameraLock = Semaphore(1, true)
@@ -183,24 +192,35 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
 
     // Binds the requested lens and calls done on the main thread once the camera is live,
     // or with the failure. Callers must not report success before done(null).
-    private fun bindCamera(facing: Int, done: (Throwable?) -> Unit) {
+    private fun bindCamera(facing: Int, id: String? = null, done: (Throwable?) -> Unit) {
         val providerFuture = ProcessCameraProvider.getInstance(this)
         providerFuture.addListener({
             try {
                 val provider = providerFuture.get()
-                val selector = CameraSelector.Builder().requireLensFacing(facing).build()
+                val selectorBuilder = CameraSelector.Builder().requireLensFacing(facing)
+                if (id != null) selectorBuilder.addCameraFilter { infos -> infos.filter { Camera2CameraInfo.from(it).cameraId == id.substringBefore('/') } }
+                val selector = selectorBuilder.build()
                 if (!provider.hasCamera(selector)) {
                     done(IllegalStateException("no ${facingName(facing)} camera"))
                     return@addListener
                 }
-                val previewUse = Preview.Builder().build().also { it.setSurfaceProvider(preview.surfaceProvider) }
-                val capture = ImageCapture.Builder()
-                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                    .build()
+                val previewBuilder = Preview.Builder()
+                val captureBuilder = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                if (id?.contains('/') == true) {
+                    require(Build.VERSION.SDK_INT >= 28) { "physical lens requires Android 9" }
+                    val manager = getSystemService(CameraManager::class.java)
+                    require(manager.getCameraCharacteristics(id.substringBefore('/')).physicalCameraIds.contains(id.substringAfter('/'))) { "unknown physical lens" }
+                    Camera2Interop.Extender(previewBuilder).setPhysicalCameraId(id.substringAfter('/'))
+                    Camera2Interop.Extender(captureBuilder).setPhysicalCameraId(id.substringAfter('/'))
+                }
+                val previewUse = previewBuilder.build().also { it.setSurfaceProvider(preview.surfaceProvider) }
+                val capture = captureBuilder.build()
                 provider.unbindAll()
                 camera = provider.bindToLifecycle(this, selector, previewUse, capture)
                 imageCapture = capture
                 lensFacing = facing
+                selectedId = id ?: Camera2CameraInfo.from(camera!!.cameraInfo).cameraId
+                configured = JSONObject()
                 // A new camera starts with the torch off and zoom 1.0.
                 syncTorch(camera!!)
                 zoom = 1.0
@@ -238,7 +258,7 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
         val cap = imageCapture ?: fail("camera not ready")
         cap.targetRotation = preview.display?.rotation ?: Surface.ROTATION_0
         val facing = facingName(lensFacing)
-        val meta = JSONObject().put("facing", facing).put("cameraId", facing).put("torch", torchOn).put("zoom", zoom)
+        val meta = JSONObject().put("facing", facing).put("cameraId", selectedId).put("settings", JSONObject(configured.toString())).put("torch", torchOn).put("zoom", zoom)
         val file = File(cacheDir, "shot-${System.nanoTime()}.jpg")
         val opts = ImageCapture.OutputFileOptions.Builder(file).build()
         cap.takePicture(opts, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
@@ -288,18 +308,21 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
         return Shot(buf.toByteArray(), out.width, out.height)
     }
 
-    override fun command(camera: String?, torchOn: Boolean?, zoom: Double?): JSONObject = withCamera { f ->
+    override fun command(camera: String?, torchOn: Boolean?, zoom: Double?, controls: JSONObject?): JSONObject = withCamera { f ->
         val target = when (camera) {
             null -> lensFacing
             "front", "user" -> CameraSelector.LENS_FACING_FRONT
             "back", "environment" -> CameraSelector.LENS_FACING_BACK
-            else -> fail("unknown camera $camera (want front or back)")
+            else -> {
+                val chars = getSystemService(CameraManager::class.java).getCameraCharacteristics(camera.substringBefore('/'))
+                chars.get(android.hardware.camera2.CameraCharacteristics.LENS_FACING) ?: fail("unknown camera")
+            }
         }
-        if (target == lensFacing && this.camera != null) {
-            applyControls(f, torchOn, zoom)
+        if ((camera == null || camera == selectedId) && target == lensFacing && this.camera != null) {
+            applyManualControls(f, torchOn, zoom, controls)
         } else {
-            bindCamera(target) { err ->
-                if (err != null) f.completeExceptionally(IllegalStateException("switch failed: ${err.message}")) else applyControls(f, torchOn, zoom)
+            bindCamera(target, camera?.takeUnless { it in listOf("front", "back", "user", "environment") }) { err ->
+                if (err != null) f.completeExceptionally(IllegalStateException("switch failed: ${err.message}")) else applyManualControls(f, torchOn, zoom, controls)
             }
         }
     }
@@ -321,7 +344,7 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
             syncTorch(cam, torch)
             zoom = (cam.cameraInfo.zoomState.value?.zoomRatio ?: 1f).toDouble()
             val side = facingName(lensFacing)
-            f.complete(JSONObject().put("facing", side).put("cameraId", side).put("torch", torchOn).put("zoom", zoom).put("connected", true))
+            f.complete(JSONObject().put("facing", side).put("cameraId", selectedId).put("settings", JSONObject(configured.toString())).put("capabilities", manual().capabilities()).put("torch", torchOn).put("zoom", zoom).put("connected", true))
             Unit
         }
         val doZoom = {
@@ -358,18 +381,63 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
                     // Zoom limits are only published for the bound camera.
                     val zs = if (info == camera?.cameraInfo) info.zoomState.value else null
                     cams.put(
-                        JSONObject().put("id", facing).put("facing", facing).put("torch", info.hasFlashUnit())
+                        JSONObject().put("id", Camera2CameraInfo.from(info).cameraId).put("label", lensLabel(Camera2CameraInfo.from(info).cameraId)).put("capabilities", ManualControls(getSystemService(CameraManager::class.java).getCameraCharacteristics(Camera2CameraInfo.from(info).cameraId)).capabilities()).put("facing", facing).put("torch", info.hasFlashUnit())
                             .put("minZoom", (zs?.minZoomRatio ?: 1f).toDouble()).put("maxZoom", (zs?.maxZoomRatio ?: 1f).toDouble()),
                     )
                 }
+                if (Build.VERSION.SDK_INT >= 28) {
+                    val manager = getSystemService(CameraManager::class.java)
+                    for (info in providerFuture.get().availableCameraInfos) {
+                        val logical = Camera2CameraInfo.from(info).cameraId
+                        for (physical in manager.getCameraCharacteristics(logical).physicalCameraIds) {
+                            val c = manager.getCameraCharacteristics(physical)
+                            cams.put(JSONObject().put("id", "$logical/$physical").put("label", lensLabel(physical) + " (physical, camera $logical)")
+                                .put("facing", facingName(info.lensFacing)).put("torch", c.get(android.hardware.camera2.CameraCharacteristics.FLASH_INFO_AVAILABLE) == true)
+                                .put("minZoom", 1).put("maxZoom", 1).put("capabilities", ManualControls(c).capabilities()))
+                        }
+                    }
+                }
                 f.complete(
-                    JSONObject().put("facing", facingName(lensFacing)).put("torch", torchOn).put("zoom", zoom).put("cameras", cams)
+                    JSONObject().put("cameraId", selectedId).put("capabilities", manual().capabilities()).put("settings", JSONObject(configured.toString())).put("facing", facingName(lensFacing)).put("torch", torchOn).put("zoom", zoom).put("cameras", cams)
                         .put("host", JSONObject().put("name", "android").put("platform", "android")),
                 )
             } catch (e: Exception) {
                 f.completeExceptionally(e)
             }
         }, mainExecutor)
+    }
+
+    private fun lensLabel(id: String): String {
+        val c = getSystemService(CameraManager::class.java).getCameraCharacteristics(id)
+        val lengths = c.get(android.hardware.camera2.CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.joinToString("/") ?: "unknown"
+        return "Camera $id ($lengths mm)"
+    }
+
+    private fun manual(): ManualControls {
+        val id = selectedId.substringAfter('/')
+        return ManualControls(getSystemService(CameraManager::class.java).getCameraCharacteristics(id))
+    }
+
+    private fun applyManualControls(f: CompletableFuture<JSONObject>, torch: Boolean?, zoom: Double?, request: JSONObject?) {
+        if (request == null) { applyControls(f, torch, zoom); return }
+        val merged = JSONObject(configured.toString())
+        // Each explicit mode replaces its entire group, so auto clears stale manual values.
+        val groups = mapOf("focusMode" to listOf("focusMode", "focusPosition", "focusPoint"),
+            "exposureMode" to listOf("exposureMode", "exposureTime", "iso", "exposureCompensation"),
+            "whiteBalanceMode" to listOf("whiteBalanceMode", "whiteBalanceGains", "whiteBalanceTemperature"))
+        for ((mode, keys) in groups) if (request.has(mode)) for (key in keys) merged.remove(key)
+        for (key in request.keys()) merged.put(key, request.get(key))
+        try {
+            // Validate the patch on its own too (manual values require explicit modes).
+            manual().options(request)
+            val options = manual().options(merged)
+            val cam = camera ?: fail("camera not ready")
+            val future = Camera2CameraControl.from(cam.cameraControl).setCaptureRequestOptions(options)
+            future.addListener({
+                try { future.get(); configured = merged; applyControls(f, torch, zoom) }
+                catch (e: Exception) { f.completeExceptionally(e.cause ?: e) }
+            }, mainExecutor)
+        } catch (e: Exception) { f.completeExceptionally(e) }
     }
 
     private fun facingName(f: Int) = if (f == CameraSelector.LENS_FACING_FRONT) "front" else "back"

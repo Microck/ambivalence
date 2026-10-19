@@ -38,7 +38,7 @@ class Identity(private val prefs: SharedPreferences) {
  */
 interface CameraHost {
     fun cameras(): JSONObject
-    fun command(camera: String?, torchOn: Boolean?, zoom: Double?): JSONObject
+    fun command(camera: String?, torchOn: Boolean?, zoom: Double?, controls: JSONObject? = null): JSONObject
     fun capture(quality: Int, maxWidth: Int): Pair<JSONObject, ByteArray>
 }
 
@@ -347,7 +347,7 @@ class HubClient(
                     val torch = if (m.has("torchOn") && !m.isNull("torchOn")) m.optBoolean("torchOn") else null
                     val zoom = if (m.has("zoomLevel") && !m.isNull("zoomLevel")) m.optDouble("zoomLevel") else null
                     val cam = m.optString("camera").ifEmpty { null }
-                    sendSealed(s, camera.command(cam, torch, zoom).put("type", "status").put("id", id))
+                    sendSealed(s, camera.command(cam, torch, zoom, m.optJSONObject("controls")).put("type", "status").put("id", id))
                 }
                 "capture" -> {
                     val q = m.optInt("quality").takeIf { it > 0 } ?: DEFAULT_QUALITY

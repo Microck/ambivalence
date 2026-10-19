@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 )
@@ -101,9 +102,12 @@ type Message struct {
 	Torch    bool    `json:"torch,omitempty"`
 	Zoom     float64 `json:"zoom,omitempty"`
 
-	Camera    string   `json:"camera,omitempty"`
-	TorchOn   *bool    `json:"torchOn,omitempty"`
-	ZoomLevel *float64 `json:"zoomLevel,omitempty"`
+	Controls     *Controls      `json:"controls,omitempty"`
+	Settings     map[string]any `json:"settings,omitempty"`
+	Capabilities map[string]any `json:"capabilities,omitempty"`
+	Camera       string         `json:"camera,omitempty"`
+	TorchOn      *bool          `json:"torchOn,omitempty"`
+	ZoomLevel    *float64       `json:"zoomLevel,omitempty"`
 
 	Connected bool      `json:"connected,omitempty"`
 	Cameras   []Camera  `json:"cameras,omitempty"`
@@ -111,11 +115,13 @@ type Message struct {
 }
 
 type Camera struct {
-	ID      string  `json:"id"`
-	Facing  string  `json:"facing"`
-	Torch   bool    `json:"torch"`
-	MinZoom float64 `json:"minZoom"`
-	MaxZoom float64 `json:"maxZoom"`
+	ID           string         `json:"id"`
+	Label        string         `json:"label,omitempty"`
+	Capabilities map[string]any `json:"capabilities,omitempty"`
+	Facing       string         `json:"facing"`
+	Torch        bool           `json:"torch"`
+	MinZoom      float64        `json:"minZoom"`
+	MaxZoom      float64        `json:"maxZoom"`
 }
 
 type HostInfo struct {
@@ -165,4 +171,72 @@ func NormalizeCode(s string) (string, error) {
 		return "", fmt.Errorf("pair code must be 6 characters from %s", codeAlphabet)
 	}
 	return s, nil
+}
+
+// Controls change independent groups; omitted groups retain their configuration.
+// Manual exposure always specifies shutter time AND ISO. Zero remains a value.
+type Controls struct {
+	FocusMode               string   `json:"focusMode,omitempty" jsonschema:"auto or manual"`
+	FocusPosition           *float64 `json:"focusPosition,omitempty" jsonschema:"normalized lens position: 0 infinity, 1 nearest; requires manual"`
+	FocusPoint              *Point   `json:"focusPoint,omitempty" jsonschema:"normalized sensor coordinates; requires auto focus"`
+	ExposureMode            string   `json:"exposureMode,omitempty" jsonschema:"auto or manual"`
+	ExposureTime            *float64 `json:"exposureTime,omitempty" jsonschema:"shutter duration in seconds; requires manual and iso"`
+	ISO                     *float64 `json:"iso,omitempty" jsonschema:"sensor ISO; requires manual and exposureTime"`
+	ExposureCompensation    *float64 `json:"exposureCompensation,omitempty" jsonschema:"EV bias; use auto exposure"`
+	WhiteBalanceMode        string   `json:"whiteBalanceMode,omitempty" jsonschema:"auto or manual"`
+	WhiteBalanceGains       *Gains   `json:"whiteBalanceGains,omitempty" jsonschema:"RGB gains; requires manual; native apps only"`
+	WhiteBalanceTemperature *float64 `json:"whiteBalanceTemperature,omitempty" jsonschema:"kelvin; requires manual; iOS and supported browsers"`
+}
+type Point struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+}
+type Gains struct {
+	Red   float64 `json:"red"`
+	Green float64 `json:"green"`
+	Blue  float64 `json:"blue"`
+}
+
+func (c Controls) Validate() error {
+	for _, mode := range []string{c.FocusMode, c.ExposureMode, c.WhiteBalanceMode} {
+		if mode != "" && mode != "auto" && mode != "manual" {
+			return fmt.Errorf("mode must be auto or manual")
+		}
+	}
+	finite := func(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
+	for _, v := range []*float64{c.FocusPosition, c.ExposureTime, c.ISO, c.ExposureCompensation, c.WhiteBalanceTemperature} {
+		if v != nil && !finite(*v) {
+			return fmt.Errorf("controls must be finite")
+		}
+	}
+	if c.FocusPosition != nil && (c.FocusMode != "manual" || *c.FocusPosition < 0 || *c.FocusPosition > 1) {
+		return fmt.Errorf("focusPosition requires manual focus and a value in [0,1]")
+	}
+	if c.FocusMode == "manual" && c.FocusPosition == nil {
+		return fmt.Errorf("manual focus requires focusPosition")
+	}
+	if p := c.FocusPoint; p != nil && (c.FocusMode != "auto" || !finite(p.X) || !finite(p.Y) || p.X < 0 || p.X > 1 || p.Y < 0 || p.Y > 1) {
+		return fmt.Errorf("focusPoint requires auto focus and coordinates in [0,1]")
+	}
+	if c.ExposureMode == "manual" {
+		if c.ExposureTime == nil || c.ISO == nil || *c.ExposureTime <= 0 || *c.ISO <= 0 || c.ExposureCompensation != nil {
+			return fmt.Errorf("manual exposure requires positive exposureTime and iso, without EV compensation")
+		}
+	} else if c.ExposureTime != nil || c.ISO != nil {
+		return fmt.Errorf("exposureTime and iso require manual exposure")
+	}
+	if c.WhiteBalanceMode == "manual" {
+		if (c.WhiteBalanceGains == nil) == (c.WhiteBalanceTemperature == nil) {
+			return fmt.Errorf("manual white balance requires exactly one of gains or temperature")
+		}
+	} else if c.WhiteBalanceGains != nil || c.WhiteBalanceTemperature != nil {
+		return fmt.Errorf("white balance values require manual mode")
+	}
+	if g := c.WhiteBalanceGains; g != nil && (!finite(g.Red) || !finite(g.Green) || !finite(g.Blue) || g.Red < 1 || g.Green < 1 || g.Blue < 1) {
+		return fmt.Errorf("RGB gains must be finite and >= 1")
+	}
+	if c.WhiteBalanceTemperature != nil && *c.WhiteBalanceTemperature <= 0 {
+		return fmt.Errorf("temperature must be positive")
+	}
+	return nil
 }

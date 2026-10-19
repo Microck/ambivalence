@@ -135,9 +135,12 @@ the mcp tools are:
 | `camera_switch` | switches to the `front` or `back` camera |
 | `camera_torch` | turns the torch on or off |
 | `camera_zoom` | sets the zoom factor |
-| `camera_list` | lists the phone's cameras and their zoom ranges |
+| `camera_list` | lists selectable lenses, zoom ranges and supported manual controls |
+| `camera_configure` | sets focus, shutter/ISO, exposure bias and white balance where supported |
 | `camera_status` | shows whether the phone is linked and online |
 | `camera_disconnect` | closes the current session; the link stays saved |
+
+See [lens selection and manual controls](docs/camera-controls.md) for capability discovery, settings and platform limits.
 
 ### without mcp
 

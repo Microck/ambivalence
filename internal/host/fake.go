@@ -111,6 +111,9 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 	torch := false
 	zoom := 1.0
 	facing := "back"
+	cameraID := "fake-back"
+	settings := map[string]any{}
+	capabilities := map[string]any{"controlsVersion": 1}
 	cams := []protocol.Camera{{
 		ID: "fake-back", Facing: "back", Torch: true, MinZoom: 1, MaxZoom: 8,
 	}, {
@@ -157,7 +160,7 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 		reply := func(r protocol.Message, jpeg []byte) { r.ID = m.ID; _ = sess.SendSealed(seal, r, jpeg) }
 		switch m.Type {
 		case protocol.TypeCameras:
-			reply(protocol.Message{Type: protocol.TypeCameras, Cameras: cams, Facing: facing, Torch: torch, Zoom: zoom,
+			reply(protocol.Message{Type: protocol.TypeCameras, Cameras: cams, Facing: facing, CameraID: cameraID, Settings: settings, Capabilities: capabilities, Torch: torch, Zoom: zoom,
 				Host: &protocol.HostInfo{Name: p.Name, Platform: "fake"}}, nil)
 		case protocol.TypeCommand:
 			if m.TorchOn != nil {
@@ -167,16 +170,52 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 				zoom = *m.ZoomLevel
 			}
 			if m.Camera != "" {
-				facing = m.Camera
+				found := false
+				for _, cam := range cams {
+					if m.Camera == cam.ID || m.Camera == cam.Facing {
+						facing = cam.Facing
+						cameraID = cam.ID
+						found = true
+						break
+					}
+				}
+				if !found {
+					reply(protocol.Message{Type: protocol.TypeError, Err: "unknown camera"}, nil)
+					return
+				}
+				settings = map[string]any{}
 			}
-			reply(protocol.Message{Type: protocol.TypeStatus, Facing: facing, CameraID: "fake-" + facing, Torch: torch, Zoom: zoom, Connected: true}, nil)
+			if m.Controls != nil {
+				if err := m.Controls.Validate(); err != nil {
+					reply(protocol.Message{Type: protocol.TypeError, Err: err.Error()}, nil)
+					return
+				}
+				b, _ := json.Marshal(m.Controls)
+				var patch map[string]any
+				_ = json.Unmarshal(b, &patch)
+				for mode, keys := range map[string][]string{
+					"focusMode":        {"focusMode", "focusPosition", "focusPoint"},
+					"exposureMode":     {"exposureMode", "exposureTime", "iso", "exposureCompensation"},
+					"whiteBalanceMode": {"whiteBalanceMode", "whiteBalanceGains", "whiteBalanceTemperature"},
+				} {
+					if _, ok := patch[mode]; ok {
+						for _, key := range keys {
+							delete(settings, key)
+						}
+					}
+				}
+				for key, value := range patch {
+					settings[key] = value
+				}
+			}
+			reply(protocol.Message{Type: protocol.TypeStatus, Facing: facing, CameraID: cameraID, Settings: settings, Capabilities: capabilities, Torch: torch, Zoom: zoom, Connected: true}, nil)
 		case protocol.TypeCapture:
 			jpegBytes, width, height, err := RenderChart(m.Quality, m.MaxWidth, facing, torch, zoom, sess.Code())
 			if err != nil {
 				reply(protocol.Message{Type: protocol.TypeError, Err: err.Error()}, nil)
 				return
 			}
-			reply(protocol.Message{Facing: facing, CameraID: "fake-" + facing, Torch: torch, Zoom: zoom, Width: width, Height: height}, jpegBytes)
+			reply(protocol.Message{Facing: facing, CameraID: cameraID, Settings: settings, Capabilities: capabilities, Torch: torch, Zoom: zoom, Width: width, Height: height}, jpegBytes)
 		default:
 			reply(protocol.Message{Type: protocol.TypeError, Err: "unknown request " + string(m.Type)}, nil)
 		}
