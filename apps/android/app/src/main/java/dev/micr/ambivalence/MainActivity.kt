@@ -197,8 +197,12 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
         providerFuture.addListener({
             try {
                 val provider = providerFuture.get()
-                val selectorBuilder = CameraSelector.Builder().requireLensFacing(facing)
-                if (id != null) selectorBuilder.addCameraFilter { infos -> infos.filter { Camera2CameraInfo.from(it).cameraId == id.substringBefore('/') } }
+                val selectorBuilder = CameraSelector.Builder()
+                if (id != null) {
+                    selectorBuilder.addCameraFilter { infos -> infos.filter { Camera2CameraInfo.from(it).cameraId == id.substringBefore('/') } }
+                } else {
+                    selectorBuilder.requireLensFacing(facing)
+                }
                 val selector = selectorBuilder.build()
                 if (!provider.hasCamera(selector)) {
                     done(IllegalStateException("no ${facingName(facing)} camera"))
@@ -440,7 +444,11 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
         } catch (e: Exception) { f.completeExceptionally(e) }
     }
 
-    private fun facingName(f: Int) = if (f == CameraSelector.LENS_FACING_FRONT) "front" else "back"
+    private fun facingName(f: Int) = when (f) {
+        CameraSelector.LENS_FACING_FRONT -> "front"
+        CameraSelector.LENS_FACING_BACK -> "back"
+        else -> "external"
+    }
 
     override fun onDestroy() {
         super.onDestroy()

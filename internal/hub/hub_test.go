@@ -585,4 +585,15 @@ func TestLensAndManualControlsSealedRoundTrip(t *testing.T) {
 	if _, err = sess.Command(ctx, protocol.Message{Controls: &protocol.Controls{ExposureMode: "manual", ISO: &iso}}); err == nil {
 		t.Fatal("incomplete exposure accepted")
 	}
+	if _, err = sess.Command(ctx, protocol.Message{Controls: &protocol.Controls{ExposureCompensation: &zero}}); err == nil {
+		t.Fatal("EV-only patch accepted while manual exposure was active")
+	}
+	got, err = sess.Cameras(ctx)
+	if err != nil || got.Meta.Settings["iso"] != iso || got.Meta.Settings["exposureCompensation"] != nil {
+		t.Fatalf("rejected EV patch changed settings: %+v %v", got.Meta.Settings, err)
+	}
+	got, err = sess.Command(ctx, protocol.Message{Controls: &protocol.Controls{ExposureMode: "auto", ExposureCompensation: &zero}})
+	if err != nil || got.Meta.Settings["exposureMode"] != "auto" || got.Meta.Settings["exposureCompensation"] != zero || got.Meta.Settings["iso"] != nil {
+		t.Fatalf("explicit auto exposure did not reset manual settings: %+v %v", got.Meta.Settings, err)
+	}
 }

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import re
 import subprocess
@@ -41,7 +42,7 @@ ENV = {**os.environ, "XDG_CONFIG_HOME": tempfile.mkdtemp(prefix="amb-bs-")}  # n
 
 def call(method: str, url: str, body: bytes | None = None, headers: dict | None = None):
     req = urllib.request.Request(url, data=body, method=method)
-    req.add_header("User-Agent", "ambivalence-smoke")
+    req.add_header("User-Agent", "OpenAI File Downloader, XaiImageApiFetch/1.0")
     req.add_header("Authorization", "Basic " + base64.b64encode(f"{USER}:{KEY}".encode()).decode())
     for k, v in (headers or {}).items():
         req.add_header(k, v)
@@ -77,8 +78,8 @@ def text(base: str, ident: str) -> str:
 
 def agent(sub: str, *rest: str, expect_ok: bool = True) -> str:
     # torch/switch/zoom take their value first; every other flag must precede positionals.
-    argv = [sub, rest[0], "--hub", HUB, *rest[1:]] if sub in ("torch", "switch", "zoom") else [sub, "--hub", HUB, *rest]
-    r = subprocess.run([BIN, *argv], capture_output=True, text=True, env=ENV)
+    argv = [sub, rest[0], "--hub", HUB, *rest[1:]] if sub in ("torch", "switch", "zoom", "configure") else [sub, "--hub", HUB, *rest]
+    r = subprocess.run([BIN, *argv], capture_output=True, text=True, env=ENV, timeout=60)
     print("$ ambivalence", *argv, "->", r.returncode, (r.stdout + r.stderr).strip()[:300])
     if (r.returncode == 0) != expect_ok:
         raise SystemExit(f"step {argv} expected {'success' if expect_ok else 'failure'}")
@@ -108,6 +109,58 @@ def restart_app(base: str) -> None:
     call("POST", f"{base}/appium/device/activate_app", json.dumps(ident).encode(), JSON)
 
 
+def manual_controls() -> None:
+    """Check exact lenses and independent controls against each lens's advertised ranges."""
+    cameras = json.loads(agent("cameras"))["cameras"]
+    for index, camera in enumerate(cameras):
+        agent("switch", camera["id"])
+        state = json.loads(agent("cameras"))
+        assert state["cameraId"] == camera["id"], "exact lens was not selected"
+        caps = state["capabilities"]
+        print("lens", camera["id"], camera.get("label"), json.dumps(caps))
+        def configure(**controls):
+            return json.loads(agent("configure", json.dumps(controls)))["settings"]
+
+        focus = "manual" in caps.get("focusMode", [])
+        if focus:
+            for position in (0, 1):
+                settings = configure(focusMode="manual", focusPosition=position)
+                assert abs(settings["focusPosition"] - position) < 0.02, settings
+        else:
+            agent("configure", '{"focusMode":"manual","focusPosition":0}', expect_ok=False)
+        if "manual" in caps.get("exposureMode", []):
+            shutter = max(caps["exposureTime"]["min"], min(0.008, caps["exposureTime"]["max"]))
+            iso = math.ceil(max(caps["iso"]["min"], min(100, caps["iso"]["max"])))
+            settings = configure(exposureMode="manual", exposureTime=shutter, iso=iso)
+            assert abs(settings["exposureTime"] - shutter) <= max(shutter * 0.02, 1e-6), settings
+            assert abs(settings["iso"] - iso) <= max(iso * 0.02, 1), settings
+            if focus:
+                assert settings["focusMode"] == "manual" and abs(settings["focusPosition"] - 1) < 0.02, settings
+            agent("configure", '{"exposureCompensation":0}', expect_ok=False)
+        if "manual" in caps.get("whiteBalanceMode", []) and "whiteBalanceGains" in caps:
+            settings = configure(whiteBalanceMode="manual", whiteBalanceGains={"red": 2, "green": 1, "blue": 1.5})
+            assert settings["whiteBalanceMode"] == "manual", settings
+            if focus:
+                assert settings["focusMode"] == "manual", settings
+        if "whiteBalanceTemperature" in caps:
+            settings = configure(whiteBalanceMode="manual", whiteBalanceTemperature=5600)
+            assert settings["whiteBalanceMode"] == "manual", settings
+        else:
+            agent("configure", '{"whiteBalanceMode":"manual","whiteBalanceTemperature":5600}', expect_ok=False)
+        agent("capture", "--max-width", "640", "-o", str(OUT / f"{DEVICE}-lens-{index}-manual.jpg"))
+        # Reset only supported groups. Fixed-focus cameras cannot accept autofocus.
+        auto = {key: "auto" for key in ("focusMode", "exposureMode", "whiteBalanceMode") if "auto" in caps.get(key, [])}
+        settings = configure(**auto)
+        for key in auto:
+            assert settings[key] == "auto", settings
+        if caps.get("focusPoint"):
+            configure(focusMode="auto", focusPoint={"x": 0.5, "y": 0.5})
+        if "exposureCompensation" in caps:
+            settings = configure(exposureMode="auto", exposureCompensation=0)
+            assert abs(settings["exposureCompensation"]) < 0.01, settings
+        agent("capture", "--max-width", "640", "-o", str(OUT / f"{DEVICE}-lens-{index}-auto.jpg"))
+
+
 def main() -> None:
     caps = {
         "platformName": "ios" if IOS else "android",
@@ -131,6 +184,8 @@ def main() -> None:
         code = text(base, "pair_code").strip()
         print("phone:", code, "|", text(base, "status_text"))
         pair(base, code)
+        manual_controls()
+        agent("switch", "back")
         # Everything after pairing uses the saved link: no code.
         agent("capture", "--max-width", "1280", "-o", str(OUT / f"{DEVICE}-back.jpg"))
         agent("torch", "on")

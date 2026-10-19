@@ -190,6 +190,11 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 					reply(protocol.Message{Type: protocol.TypeError, Err: err.Error()}, nil)
 					return
 				}
+				// An EV-only patch retains the current mode, which may be manual.
+				if m.Controls.ExposureCompensation != nil && m.Controls.ExposureMode == "" && settings["exposureMode"] == "manual" {
+					reply(protocol.Message{Type: protocol.TypeError, Err: "EV bias requires auto exposure"}, nil)
+					return
+				}
 				b, _ := json.Marshal(m.Controls)
 				var patch map[string]any
 				_ = json.Unmarshal(b, &patch)
