@@ -11,6 +11,7 @@ final class CameraHost: NSObject, ObservableObject, @unchecked Sendable {
     @Published var hubURL: String
     @Published var torchOn = false
     @Published var linked: Bool
+    @Published private(set) var forgettingAgent = false
     /// The SAS of a pairing waiting for the user to confirm or cancel.
     @Published var sas: String?
 
@@ -25,6 +26,7 @@ final class CameraHost: NSObject, ObservableObject, @unchecked Sendable {
     private var resolving: [NetService] = []
     private var found: [(name: String, urls: [String])] = [] // discovered hubs, in discovery order
     private var slots: [String: Slot] = [:] // by hub key: the saved URL, or "bonjour:" + service name
+    private var retiring: [UUID: HubConnection] = [:] // retained until their actor has closed
     private var dials = 0
     private var prompts: [Prompt] = []
 
@@ -114,6 +116,28 @@ final class CameraHost: NSObject, ObservableObject, @unchecked Sendable {
         Task {
             do { try await camera.toggleTorch() } catch { DispatchQueue.main.async { self.status = error.localizedDescription } }
         }
+    }
+
+    /// Close all sessions before deleting their shared key. Old actors and queued prompts must
+    /// finish closing before discovery may open replacements or another pairing may save a key.
+    @MainActor
+    func forgetAgent() async {
+        guard !forgettingAgent else { return }
+        forgettingAgent = true
+        let connections = slots.values.compactMap(\.conn) + Array(retiring.values)
+        slots.removeAll()
+        resolve { _ in true }
+        refresh()
+        for connection in connections { await connection.close() }
+
+        var deletionError: Error?
+        do { try identity.clearKey() } catch { deletionError = error }
+        linked = identity.key != nil
+        // Discovery can change while close() suspends. Rebuild from the current wanted hubs.
+        slots.removeAll()
+        forgettingAgent = false
+        if started { reconcile() } else { refresh() }
+        if let deletionError { status = "could not forget agent: \(deletionError.localizedDescription)" }
     }
 
     /// The user's answer on the pairing screen.
@@ -230,7 +254,7 @@ final class CameraHost: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     private func dial(_ key: String) {
-        guard started, var s = slots[key], s.conn == nil, s.parkedBehind == nil else { return }
+        guard started, !forgettingAgent, var s = slots[key], s.conn == nil, s.parkedBehind == nil else { return }
         let urls = s.order.compactMap(URL.init(string:))
         guard !urls.isEmpty else { return }
         dials += 1
@@ -282,7 +306,13 @@ final class CameraHost: NSObject, ObservableObject, @unchecked Sendable {
 
     private func drop(_ c: HubConnection) {
         cancelPrompts(for: c.id)
-        Task { await c.close() }
+        // A removed slot can still have a confirmed pairing waiting to resume on its actor.
+        // Forgetting must wait for that actor too, so it cannot save a key after deletion.
+        retiring[c.id] = c
+        Task { @MainActor in
+            await c.close()
+            retiring[c.id] = nil
+        }
     }
 
     private func resolve(cancelling match: (Prompt) -> Bool) {
@@ -300,6 +330,11 @@ final class CameraHost: NSObject, ObservableObject, @unchecked Sendable {
     /// Shows the most useful state across hubs and the pair code of the saved hub, else of the
     /// first hub that answered.
     private func refresh() {
+        guard !forgettingAgent else {
+            code = "------"
+            status = "forgetting agent"
+            return
+        }
         let live = slots.filter { $0.value.parkedBehind == nil }
         let shown = live[saved].flatMap { $0.code != nil ? $0 : nil }
             ?? live.values.filter { $0.code != nil }.min { $0.since < $1.since }

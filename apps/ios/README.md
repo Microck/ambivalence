@@ -4,6 +4,10 @@ SwiftUI + AVFoundation. Same `/v1` protocol as Android and the web host. Needs m
 
 The hub is untrusted (see `docs/protocol.md`). `Link.swift` ports `internal/link` with CryptoKit; debug builds check it against the pinned vectors at launch (`LinkCheck.swift`). Pairing shows the SAS for the user to confirm, and the resulting link key is kept in the Keychain (this device only) and never sent to a hub. The app connects to the saved hub plus hubs found on the Wi-Fi (at most 4), each socket with its own agent session, and keeps one connection per `hubId`, preferring the saved URL.
 
+## Forget an agent
+
+Tap **forget agent**, then confirm to remove the saved pairing and disconnect every active agent session, including sessions on other hubs. Pending pairing prompts are cancelled. The app keeps its hub address, device identity and camera permissions, then reconnects with fresh pairing codes. The previous agent must pair again before it can use the camera. If the Keychain cannot delete the link key, the app reports the failure and keeps the saved pairing.
+
 ```
 cd apps/ios
 xcodegen generate

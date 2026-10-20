@@ -1,6 +1,6 @@
 {
   "name": "ambivalence",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "give your coding agent a camera: your phone. pair once over mcp or cli, found on your wi-fi, end-to-end encrypted",
   "license": "MIT",
   "homepage": "https://github.com/Microck/ambivalence",
@@ -38,5 +38,5 @@
     "x64",
     "arm64"
   ],
-  "binaryVersion": "0.2.1"
+  "binaryVersion": "0.2.2"
 }

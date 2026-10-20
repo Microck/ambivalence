@@ -4,6 +4,7 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var host = CameraHost()
     @FocusState private var editingHub: Bool
+    @State private var confirmingForget = false
 
     var body: some View {
         ZStack {
@@ -27,6 +28,14 @@ struct ContentView: View {
                         .accessibilityIdentifier("pair_code")
                     Text(host.linked ? "linked: just ask your agent to use the camera" : host.code == "------" ? "" : "first time only, on the agent: ambivalence pair \(host.code)")
                         .font(.system(size: 13, design: .monospaced))
+                    if host.linked {
+                        Button("forget agent", role: .destructive) { confirmingForget = true }
+                            .font(.system(size: 13, design: .monospaced))
+                            .foregroundStyle(.white)
+                            .frame(minHeight: 44)
+                            .accessibilityIdentifier("forget_agent")
+                            .disabled(host.forgettingAgent)
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 20)
@@ -66,6 +75,14 @@ struct ContentView: View {
             }
         }
         .background(Color.black)
+        .confirmationDialog("forget this agent?", isPresented: $confirmingForget, titleVisibility: .visible) {
+            Button("forget agent", role: .destructive) {
+                Task { await host.forgetAgent() }
+            }
+            Button("cancel", role: .cancel) {}
+        } message: {
+            Text("This disconnects all agent sessions. Pair again to use the camera.")
+        }
         .onAppear { host.start() }
         .onChange(of: host.sas) { _, sas in if sas != nil { editingHub = false } }
         // ambivalence://host?hub=wss://…/v1, printed as a QR code by `ambivalence hub`.

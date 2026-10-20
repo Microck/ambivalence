@@ -46,6 +46,21 @@ final class Identity: @unchecked Sendable { // key is guarded by lock; device is
         cached = key
     }
 
+    /// Forget the persisted and in-memory key together. A failed delete must not claim success.
+    func clearKey() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        let status = SecItemDelete([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Identity.service,
+            kSecAttrAccount as String: Identity.account,
+        ] as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw LinkError("could not delete the link key (keychain \(status))")
+        }
+        cached = nil
+    }
+
     private static func load() -> Data? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
