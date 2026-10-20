@@ -8,6 +8,8 @@ The hub is untrusted (see `docs/protocol.md`). `Link.swift` ports `internal/link
 
 Tap **forget agent**, then confirm to remove the saved pairing and disconnect every active agent session, including sessions on other hubs. Pending pairing prompts are cancelled. The app keeps its hub address, device identity and camera permissions, then reconnects with fresh pairing codes. The previous agent must pair again before it can use the camera. If the Keychain cannot delete the link key, the app reports the failure and keeps the saved pairing.
 
+The native pairing tests use the real simulator Keychain and loopback Go hubs. CI runs them on an erased simulator and signs the simulator app with `CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=-`. Leaving it unsigned prevents Keychain access with error `-34018`. Device release builds remain unsigned for sideload signing.
+
 ```
 cd apps/ios
 xcodegen generate
