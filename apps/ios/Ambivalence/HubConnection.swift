@@ -84,6 +84,7 @@ actor HubConnection {
 
     func close() {
         closed = true
+        resetAgent()
         task?.cancel(with: .goingAway, reason: nil)
         cancelPrompt()
     }
@@ -332,6 +333,7 @@ actor HubConnection {
     // MARK: wire
 
     private func send(_ obj: [String: Any]) {
+        guard !closed else { return }
         guard let text = HubConnection.encode(obj) else { return }
         task?.send(.string(text)) { _ in }
     }
@@ -343,6 +345,7 @@ actor HubConnection {
     /// Seals a reply and, for a frame, its JPEG as the next box. Nothing suspends between sealing
     /// and enqueueing, and the socket sends in enqueue order, so sequence order is wire order.
     private func sendSealed(_ s: Seal, _ obj: [String: Any], jpeg: Data? = nil) {
+        guard !closed else { return }
         guard let inner = HubConnection.encode(obj),
               let outer = HubConnection.encode(["type": "sealed", "id": obj["id"] as? String ?? "",
                                                 "box": s.tx.seal(Data(inner.utf8)).base64EncodedString()]) else { return }

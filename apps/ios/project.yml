@@ -13,8 +13,8 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: ambivalence
-        CFBundleShortVersionString: "0.2.1"
-        CFBundleVersion: "3"
+        CFBundleShortVersionString: "0.2.2"
+        CFBundleVersion: "4"
         CFBundleURLTypes:
           - CFBundleURLName: dev.micr.ambivalence
             CFBundleURLSchemes: [ambivalence]
@@ -36,3 +36,21 @@ targets:
         TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_STYLE: Manual
         CODE_SIGNING_ALLOWED: NO
+  AmbivalenceTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [AmbivalenceTests]
+    dependencies:
+      - target: Ambivalence
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_VERSION: "5.0"
+        CODE_SIGNING_ALLOWED: NO
+schemes:
+  Ambivalence:
+    build:
+      targets:
+        Ambivalence: all
+    test:
+      targets: [AmbivalenceTests]
