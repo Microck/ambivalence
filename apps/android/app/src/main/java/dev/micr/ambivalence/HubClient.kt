@@ -40,6 +40,20 @@ interface CameraHost {
     fun cameras(): JSONObject
     fun command(camera: String?, torchOn: Boolean?, zoom: Double?, controls: JSONObject? = null): JSONObject
     fun capture(quality: Int, maxWidth: Int): Pair<JSONObject, ByteArray>
+
+    /** One clip, capped by the agent at 60 s. Returns metadata and a WAV file. */
+    fun listen(durationMs: Int, sampleRate: Int): Pair<JSONObject, ByteArray>
+
+    /** Starts continuous recording; a zero max means until stop. */
+    fun audioStart(maxDurationMs: Int, sampleRate: Int): JSONObject
+
+    /** Drains audio recorded since the previous call, waiting up to maxMs for it. */
+    fun audioRead(listenId: String, maxMs: Int): Pair<JSONObject, ByteArray>
+
+    /** Stops the session with this id, or any session when null (agent left). */
+    fun audioStop(listenId: String?): JSONObject
+
+    fun level(durationMs: Int, sampleRate: Int): JSONObject
 }
 
 /**
@@ -197,7 +211,7 @@ class HubClient(
             "pair3" -> pair3(m)
             "sealed" -> sealed(m)
             // Unsealed camera requests never count, even after auth: a hub could inject them.
-            "cameras", "command", "capture" -> sendError(id, UNAUTHENTICATED)
+            "cameras", "command", "capture", "listen", "audio_start", "audio_read", "audio_stop", "level" -> sendError(id, UNAUTHENTICATED)
             "error" -> events.note(m.optString("error"))
         }
     }
@@ -219,6 +233,8 @@ class HubClient(
     }
 
     private fun resetAgent(present: Boolean) {
+        // Privacy: no microphone survives an agent leaving, reconnecting or being replaced.
+        runCatching { camera.audioStop(null) }
         agentHere = present
         seal = null
         challenge = null
@@ -356,6 +372,33 @@ class HubClient(
                     meta.put("type", "frame").put("id", id).put("mime", "image/jpeg").put("bytes", jpeg.size)
                     sendSealed(s, meta, jpeg)
                 }
+                "listen" -> {
+                    val ms = m.optInt("durationMs").takeIf { it > 0 } ?: DEFAULT_AUDIO_MS
+                    val rate = m.optInt("sampleRate").takeIf { it > 0 } ?: DEFAULT_SAMPLE_RATE
+                    val (meta, wav) = camera.listen(ms, rate)
+                    meta.put("type", "frame").put("id", id).put("mime", "audio/wav").put("bytes", wav.size)
+                    sendSealed(s, meta, wav)
+                }
+                "audio_start" -> {
+                    val max = m.optInt("maxDurationMs")
+                    val rate = m.optInt("sampleRate").takeIf { it > 0 } ?: DEFAULT_SAMPLE_RATE
+                    sendSealed(s, camera.audioStart(max, rate).put("type", "audio_started").put("id", id))
+                }
+                "audio_read" -> {
+                    val ms = (m.optInt("durationMs").takeIf { it > 0 } ?: DEFAULT_CHUNK_MS).coerceIn(100, MAX_CHUNK_MS)
+                    val (meta, wav) = camera.audioRead(m.optString("listenId"), ms)
+                    meta.put("type", "frame").put("id", id).put("mime", "audio/wav").put("bytes", wav.size)
+                    sendSealed(s, meta, wav)
+                }
+                "audio_stop" -> {
+                    val meta = camera.audioStop(m.optString("listenId").takeIf { it.isNotEmpty() })
+                    sendSealed(s, meta.put("type", "status").put("id", id))
+                }
+                "level" -> {
+                    val ms = (m.optInt("durationMs").takeIf { it > 0 } ?: 1000).coerceIn(100, MAX_CHUNK_MS)
+                    val rate = m.optInt("sampleRate").takeIf { it > 0 } ?: DEFAULT_SAMPLE_RATE
+                    sendSealed(s, camera.level(ms, rate).put("type", "levels").put("id", id))
+                }
                 else -> sendSealed(s, JSONObject().put("type", "error").put("id", id).put("error", "unknown request $type"))
             }
         } catch (e: Exception) {
@@ -370,9 +413,9 @@ class HubClient(
 
     private fun sendError(id: String, err: String) = send(JSONObject().put("type", "error").put("id", id).put("error", err))
 
-    // Seals under the write lock so wire order equals sequence order; a frame's JPEG follows as
-    // its own box. The outer id only routes; the agent checks the inner one.
-    private fun sendSealed(s: Seal, inner: JSONObject, jpeg: ByteArray? = null) {
+    // Seals under the write lock so wire order equals sequence order; a frame's payload follows
+    // as its own box. The outer id only routes; the agent checks the inner one.
+    private fun sendSealed(s: Seal, inner: JSONObject, payload: ByteArray? = null) {
         inner.put("v", 1)
         synchronized(writeLock) {
             val ws = socket ?: return
@@ -381,7 +424,7 @@ class HubClient(
                 JSONObject().put("v", 1).put("type", "sealed").put("id", inner.optString("id"))
                     .put("box", Base64.getEncoder().encodeToString(box)).toString(),
             )
-            if (jpeg != null) ws.send(s.tx.seal(jpeg).toByteString())
+            if (payload != null) ws.send(s.tx.seal(payload).toByteString())
         }
     }
 
@@ -389,6 +432,10 @@ class HubClient(
         const val UNAUTHENTICATED = "agent not authenticated"
         private const val DEFAULT_QUALITY = 80
         private const val DEFAULT_MAX_WIDTH = 1280
+        private const val DEFAULT_SAMPLE_RATE = 16000
+        private const val DEFAULT_AUDIO_MS = 5000
+        private const val DEFAULT_CHUNK_MS = 10000
+        private const val MAX_CHUNK_MS = 30000
         private val baseHttp: OkHttpClient by lazy {
             OkHttpClient.Builder()
                 .readTimeout(0, TimeUnit.MILLISECONDS)

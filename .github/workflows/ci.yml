@@ -93,6 +93,7 @@ jobs:
           xcrun simctl bootstatus "$device_id" -b
           xcrun simctl install "$device_id" build/sim/Build/Products/Debug-iphonesimulator/Ambivalence.app
           xcrun simctl privacy "$device_id" grant camera dev.micr.ambivalence
+          xcrun simctl privacy "$device_id" grant microphone dev.micr.ambivalence
           go build -o build/test-hub ../../cmd/ambivalence
           build/test-hub hub --listen 127.0.0.1:17842 > build/hub-a.log 2>&1 &
           hub_a=$!

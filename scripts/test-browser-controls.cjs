@@ -161,7 +161,7 @@ test('invalid hub URLs are reported without throwing or closing the current sock
   for (const value of ['ws://', 'wss://example.test/#fragment', 'ws://example.test/v1#', 'ws://user:pass@example.test/v1']) {
     let status = '', closed = false;
     const context = vm.createContext({ URL, hubEl: { value, blur() {} },
-      ws: { close() { closed = true; } }, setStatus(s) { status = s; },
+      ws: { close() { closed = true; } }, setStatus(s) { status = s; }, haltListening() {},
       WebSocket: class { constructor() { throw new Error('must not open a socket'); } } });
     vm.runInContext(connectSource, context);
     assert.doesNotThrow(() => context.connect(), value);
@@ -201,7 +201,7 @@ test('late close from a replaced socket does not reset the current link', () => 
     hubEl: { value: 'ws://127.0.0.1:17842/v1', blur() {} }, setStatus() {},
     cancelConfirm() { cancelled++; }, agentHere: true, seal: { active: true },
     clearTimeout() {}, squatTimer: null, challenge: null, pairing: null,
-    setTimeout() {}, send() {}, onMessage() {}, ident: { device: 'fixture' } });
+    setTimeout() {}, send() {}, onMessage() {}, haltListening() {}, ident: { device: 'fixture' } });
   vm.runInContext(html.slice(html.indexOf('  function connect()'), html.indexOf('  $("connect").onclick')), context);
   context.connect(); context.connect();
   context.agentHere = true; context.seal = {active:true}; cancelled = 0;
@@ -215,7 +215,7 @@ test('replacement socket clears the previous peer authentication state', () => {
     ws: {close() {}}, hubEl: {value:'ws://127.0.0.1:17842/v1',blur() {}},
     setStatus() {}, cancelConfirm() {}, clearTimeout() {}, setTimeout() {},
     agentHere:true, seal:{old:true}, challenge:{old:true}, pairing:{old:true}, squatTimer:123,
-    ident:{device:'fixture'}, send() {}, onMessage() {} });
+    ident:{device:'fixture'}, send() {}, onMessage() {}, haltListening() {} });
   vm.runInContext(html.slice(html.indexOf('  function connect()'),html.indexOf('  $("connect").onclick')),context);
   context.connect();
   assert.equal(context.agentHere,false);

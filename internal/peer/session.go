@@ -18,7 +18,7 @@ import (
 
 type Frame struct {
 	Meta protocol.Message
-	JPEG []byte
+	Data []byte
 }
 
 type Session struct {
@@ -189,6 +189,97 @@ func (s *Session) Capture(ctx context.Context, quality, maxWidth int) (Frame, er
 		Quality:  quality,
 		MaxWidth: maxWidth,
 	})
+}
+
+// Listen records one clip and returns it as a WAV file. For listening longer than
+// MaxOneShotAudioMs, use the session methods below and read chunks as they arrive.
+func (s *Session) Listen(ctx context.Context, durationMs, sampleRate int) (Frame, error) {
+	durationMs, sampleRate, err := protocol.NormalizeAudio(durationMs, sampleRate, protocol.DefaultAudioMs, protocol.MaxOneShotAudioMs)
+	if err != nil {
+		return Frame{}, err
+	}
+	if err := s.requireAudio(ctx); err != nil {
+		return Frame{}, err
+	}
+	return s.call(ctx, protocol.Message{Type: protocol.TypeListen, DurationMs: durationMs, SampleRate: sampleRate})
+}
+
+// AudioStart begins continuous recording. The phone buffers audio until AudioRead drains it,
+// so an agent may take its time between chunks without losing sound.
+func (s *Session) AudioStart(ctx context.Context, maxDurationMs, sampleRate int) (protocol.Message, error) {
+	if sampleRate == 0 {
+		sampleRate = protocol.DefaultAudioSampleRate
+	}
+	if sampleRate < protocol.MinAudioSampleRate || sampleRate > protocol.MaxAudioSampleRate {
+		return protocol.Message{}, fmt.Errorf("sample rate must be between %d and %d Hz", protocol.MinAudioSampleRate, protocol.MaxAudioSampleRate)
+	}
+	if maxDurationMs < 0 || maxDurationMs > protocol.MaxSessionMs {
+		return protocol.Message{}, fmt.Errorf("max duration must be between 0 and %d ms", protocol.MaxSessionMs)
+	}
+	if err := s.requireAudio(ctx); err != nil {
+		return protocol.Message{}, err
+	}
+	fr, err := s.call(ctx, protocol.Message{Type: protocol.TypeAudioStart, MaxDurationMs: maxDurationMs, SampleRate: sampleRate})
+	if err != nil {
+		return protocol.Message{}, err
+	}
+	if fr.Meta.Type != protocol.TypeAudioStarted || fr.Meta.ListenID == "" {
+		return protocol.Message{}, fmt.Errorf("phone did not start an audio session")
+	}
+	return fr.Meta, nil
+}
+
+// AudioRead returns audio recorded since the previous read, as a complete WAV chunk. If no
+// new audio is buffered yet it waits up to chunkMs for some to arrive.
+func (s *Session) AudioRead(ctx context.Context, listenID string, chunkMs int) (Frame, error) {
+	if listenID == "" {
+		return Frame{}, fmt.Errorf("listen id required")
+	}
+	if chunkMs == 0 {
+		chunkMs = protocol.DefaultChunkMs
+	}
+	if chunkMs < 100 || chunkMs > protocol.MaxChunkMs {
+		return Frame{}, fmt.Errorf("chunk must be between 100 and %d ms", protocol.MaxChunkMs)
+	}
+	return s.call(ctx, protocol.Message{Type: protocol.TypeAudioRead, ListenID: listenID, DurationMs: chunkMs})
+}
+
+// AudioStop ends a session and returns how much audio it recorded.
+func (s *Session) AudioStop(ctx context.Context, listenID string) (protocol.Message, error) {
+	if listenID == "" {
+		return protocol.Message{}, fmt.Errorf("listen id required")
+	}
+	fr, err := s.call(ctx, protocol.Message{Type: protocol.TypeAudioStop, ListenID: listenID})
+	if err != nil {
+		return protocol.Message{}, err
+	}
+	return fr.Meta, nil
+}
+
+// Level measures loudness for durationMs without returning audio.
+func (s *Session) Level(ctx context.Context, durationMs int) (Frame, error) {
+	durationMs, sampleRate, err := protocol.NormalizeAudio(durationMs, 0, 1000, protocol.MaxChunkMs)
+	if err != nil {
+		return Frame{}, err
+	}
+	if err := s.requireAudio(ctx); err != nil {
+		return Frame{}, err
+	}
+	return s.call(ctx, protocol.Message{Type: protocol.TypeLevel, DurationMs: durationMs, SampleRate: sampleRate})
+}
+
+// requireAudio asks the phone what it supports before sending audio requests. Older hosts
+// ignore unknown fields, so without this an agent would record silence instead of learning
+// that the app needs an update.
+func (s *Session) requireAudio(ctx context.Context) error {
+	info, err := s.Cameras(ctx)
+	if err != nil {
+		return err
+	}
+	if info.Meta.Capabilities["audioVersion"] != float64(1) {
+		return fmt.Errorf("host does not support audio; update the phone app")
+	}
+	return nil
 }
 
 func (s *Session) Command(ctx context.Context, msg protocol.Message) (Frame, error) {
@@ -393,12 +484,16 @@ func (s *Session) Send(msg protocol.Message) error {
 	return s.send(msg)
 }
 
-// SendSealed seals msg (and jpeg, sent as the following binary box) under seal. Sealing happens
-// under the write lock so sequence order always equals wire order.
-func (s *Session) SendSealed(seal *Seal, msg protocol.Message, jpeg []byte) error {
+// SendSealed seals msg (and payload, sent as the following binary box) under seal. Sealing
+// happens under the write lock so sequence order always equals wire order.
+func (s *Session) SendSealed(seal *Seal, msg protocol.Message, payload []byte) error {
 	msg.V = protocol.Version
-	if jpeg != nil {
-		msg.Type, msg.Bytes, msg.Mime = protocol.TypeFrame, len(jpeg), "image/jpeg"
+	if payload != nil {
+		msg.Type = protocol.TypeFrame
+		msg.Bytes = len(payload)
+		if msg.Mime == "" {
+			msg.Mime = "image/jpeg"
+		}
 	}
 	inner, err := protocol.Encode(msg)
 	if err != nil {
@@ -410,11 +505,11 @@ func (s *Session) SendSealed(seal *Seal, msg protocol.Message, jpeg []byte) erro
 	if err := s.writeJSON(protocol.Message{Type: protocol.TypeSealed, ID: msg.ID, Box: base64.StdEncoding.EncodeToString(seal.tx.Seal(inner))}); err != nil {
 		return err
 	}
-	if jpeg == nil {
+	if payload == nil {
 		return nil
 	}
 	s.ws.SetWriteDeadline(time.Now().Add(15 * time.Second))
-	return s.ws.WriteMessage(websocket.BinaryMessage, seal.tx.Seal(jpeg))
+	return s.ws.WriteMessage(websocket.BinaryMessage, seal.tx.Seal(payload))
 }
 
 // Open unseals a sealed message received by a host (hosts never receive binary from agents).
@@ -495,7 +590,8 @@ func (s *Session) writeJSON(msg protocol.Message) error {
 	return s.ws.WriteMessage(websocket.TextMessage, b)
 }
 
-// openSealed opens a sealed message on the read loop; a sealed frame's JPEG is the next binary box.
+// openSealed opens a sealed message on the read loop; a sealed frame's payload is the next
+// binary box. Image and audio payloads have different caps.
 func (s *Session) openSealed(msg protocol.Message) (protocol.Message, []byte, error) {
 	s.authMu.Lock()
 	seal := s.seal
@@ -507,17 +603,21 @@ func (s *Session) openSealed(msg protocol.Message) (protocol.Message, []byte, er
 	if err != nil || inner.Type != protocol.TypeFrame {
 		return inner, nil, err
 	}
-	s.ws.SetReadDeadline(time.Now().Add(20 * time.Second))
+	limit := protocol.MaxJPEGBytes
+	if inner.Mime == protocol.AudioMime {
+		limit = protocol.MaxAudioBytes
+	}
+	s.ws.SetReadDeadline(time.Now().Add(60 * time.Second))
 	mt, box, err := s.ws.ReadMessage()
 	s.ws.SetReadDeadline(time.Time{})
 	if err != nil {
 		return inner, nil, err
 	}
-	if mt != websocket.BinaryMessage || len(box) > protocol.MaxJPEGBytes+64 {
+	if mt != websocket.BinaryMessage || len(box) > limit+64 {
 		return inner, nil, fmt.Errorf("bad frame payload")
 	}
-	jpeg, err := seal.rx.Open(box)
-	return inner, jpeg, err
+	payload, err := seal.rx.Open(box)
+	return inner, payload, err
 }
 
 func (s *Session) readLoop() {
@@ -545,13 +645,13 @@ func (s *Session) readLoop() {
 		if err != nil {
 			continue
 		}
-		var jpeg []byte
+		var payload []byte
 		if s.hostCh == nil {
 			// Agent: camera traffic counts only if sealed by the authenticated phone. Unsealed
 			// messages are hub status, auth, pairing (verified by MAC) or errors (DoS at worst).
 			if msg.Type == protocol.TypeSealed {
 				outer := msg.ID
-				if msg, jpeg, err = s.openSealed(msg); err == nil && msg.ID != outer {
+				if msg, payload, err = s.openSealed(msg); err == nil && msg.ID != outer {
 					err = fmt.Errorf("sealed id mismatch")
 				}
 				if err != nil {
@@ -579,7 +679,7 @@ func (s *Session) readLoop() {
 			s.pendMu.Unlock()
 			if ok {
 				select {
-				case ch <- Frame{Meta: msg, JPEG: jpeg}:
+				case ch <- Frame{Meta: msg, Data: payload}:
 				default:
 				}
 				continue
@@ -587,7 +687,7 @@ func (s *Session) readLoop() {
 		}
 		if s.hostCh != nil {
 			select {
-			case s.hostCh <- Frame{Meta: msg, JPEG: jpeg}:
+			case s.hostCh <- Frame{Meta: msg, Data: payload}:
 			default:
 			}
 		}

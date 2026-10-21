@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"golang.org/x/image/font/basicfont"
 	"golang.org/x/image/math/fixed"
 
+	"github.com/Microck/ambivalence/internal/audio"
 	"github.com/Microck/ambivalence/internal/link"
 	"github.com/Microck/ambivalence/internal/peer"
 	"github.com/Microck/ambivalence/internal/protocol"
@@ -61,6 +63,68 @@ func (p *Phone) setKey(k []byte) {
 type phoneState struct {
 	Device string `json:"device"`
 	Key    string `json:"key,omitempty"`
+}
+
+// fakeAudio is a live recording session: samples exist from the moment it started, and reads
+// consume them in order so an agent that polls slowly still receives every second.
+type fakeAudio struct {
+	id      string
+	rate    int
+	started time.Time
+	maxMs   int
+	read    int64 // samples handed to the agent
+	ended   bool
+}
+
+func (a *fakeAudio) available() (int64, bool) {
+	elapsed := time.Since(a.started).Milliseconds()
+	ended := false
+	if a.maxMs > 0 && elapsed >= int64(a.maxMs) {
+		elapsed = int64(a.maxMs)
+		ended = true
+	}
+	return elapsed * int64(a.rate) / 1000, ended
+}
+
+// take returns at most maxMs of contiguous audio after the previous read. totalMs is the
+// session's recorded length so far.
+func (a *fakeAudio) take(maxMs int) (pcm []byte, totalMs int, ended bool) {
+	avail, ended := a.available()
+	want := int64(maxMs) * int64(a.rate) / 1000
+	n := avail - a.read
+	if n < 0 {
+		n = 0
+	}
+	if n > want {
+		n = want
+	}
+	pcm = fakeTonePCM(a.read, n, a.rate)
+	a.read += n
+	if ended && a.read >= avail {
+		a.ended = true
+	}
+	return pcm, int(avail * 1000 / int64(a.rate)), a.ended
+}
+
+// fakeTonePCM is a deterministic two-tone test signal so agents and tests hear something
+// non-silent. It is computed from the absolute sample index, which keeps chunk joins seamless.
+func fakeTonePCM(first, count int64, rate int) []byte {
+	pcm := make([]byte, count*2)
+	for i := int64(0); i < count; i++ {
+		n := first + i
+		t := float64(n) / float64(rate)
+		freq := 440.0
+		if int(t)%2 == 1 {
+			freq = 660
+		}
+		amp := 0.0
+		if math.Mod(t, 1) < 0.6 {
+			amp = 0.25
+		}
+		v := int16(amp * 32767 * math.Sin(2*math.Pi*freq*t))
+		binary.LittleEndian.PutUint16(pcm[i*2:], uint16(v))
+	}
+	return pcm
 }
 
 // LoadPhone restores a fake phone from path (or makes a new one there). An empty path keeps
@@ -129,6 +193,8 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 		"whiteBalanceMode":        []string{"auto", "manual"},
 		"whiteBalanceTemperature": positive,
 		"whiteBalanceGains":       map[string]any{"min": 1, "max": math.MaxFloat64},
+		"audioVersion":            1,
+		"audio":                   protocol.AudioCapabilities(),
 	}
 	cams := []protocol.Camera{{
 		ID: "fake-back", Facing: "back", Torch: true, MinZoom: 1, MaxZoom: 8, Capabilities: capabilities,
@@ -145,6 +211,7 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 		pairing   *link.Party
 		pairNB    []byte
 		pairCmt   []byte
+		listen    *fakeAudio
 	)
 	agentHere := false
 	// newAgent runs when an agent arrives or leaves. The hub repeats status (welcome, then a
@@ -154,7 +221,7 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 			return
 		}
 		agentHere = present
-		seal, challenge, pairing, deadline = nil, nil, nil, nil
+		seal, challenge, pairing, deadline, listen = nil, nil, nil, nil, nil
 		if !present {
 			return
 		}
@@ -167,7 +234,7 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 	reject := func() {
 		_ = sess.Send(protocol.Message{Type: protocol.TypeReject})
 		// The hub frees the slot at once, so the next agent's status is a real arrival.
-		agentHere, seal, challenge, pairing, deadline = false, nil, nil, nil, nil
+		agentHere, seal, challenge, pairing, deadline, listen = false, nil, nil, nil, nil, nil
 	}
 	newAgent(sess.Status().Connected)
 
@@ -239,6 +306,65 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 				return
 			}
 			reply(protocol.Message{Facing: facing, CameraID: cameraID, Settings: settings, Capabilities: capabilities, Torch: torch, Zoom: zoom, Width: width, Height: height}, jpegBytes)
+		case protocol.TypeListen:
+			duration, rate, err := protocol.NormalizeAudio(m.DurationMs, m.SampleRate, protocol.DefaultAudioMs, protocol.MaxOneShotAudioMs)
+			if err != nil {
+				reply(protocol.Message{Type: protocol.TypeError, Err: err.Error()}, nil)
+				return
+			}
+			pcm := fakeTonePCM(0, int64(duration*rate/1000), rate)
+			level := audio.Level(pcm)
+			reply(protocol.Message{Mime: protocol.AudioMime, DurationMs: duration, SampleRate: rate, Levels: &level}, audio.EncodeWAV(pcm, rate))
+		case protocol.TypeAudioStart:
+			rate := m.SampleRate
+			if rate == 0 {
+				rate = protocol.DefaultAudioSampleRate
+			}
+			if rate < protocol.MinAudioSampleRate || rate > protocol.MaxAudioSampleRate {
+				reply(protocol.Message{Type: protocol.TypeError, Err: "unsupported sample rate"}, nil)
+				return
+			}
+			if m.MaxDurationMs < 0 || m.MaxDurationMs > protocol.MaxSessionMs {
+				reply(protocol.Message{Type: protocol.TypeError, Err: "invalid max duration"}, nil)
+				return
+			}
+			listen = &fakeAudio{id: randomHex(8), rate: rate, started: time.Now(), maxMs: m.MaxDurationMs}
+			reply(protocol.Message{Type: protocol.TypeAudioStarted, ListenID: listen.id, SampleRate: rate, MaxDurationMs: m.MaxDurationMs}, nil)
+		case protocol.TypeAudioRead:
+			if listen == nil || m.ListenID != listen.id {
+				reply(protocol.Message{Type: protocol.TypeError, Err: "no such audio session"}, nil)
+				return
+			}
+			want := int64(m.DurationMs) * int64(listen.rate) / 1000
+			deadline := time.Now().Add(time.Duration(m.DurationMs+5000) * time.Millisecond)
+			for {
+				avail, ended := listen.available()
+				if avail-listen.read >= want || ended || time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			pcm, totalMs, ended := listen.take(m.DurationMs)
+			level := audio.Level(pcm)
+			reply(protocol.Message{Mime: protocol.AudioMime, DurationMs: len(pcm) * 1000 / (listen.rate * 2), SampleRate: listen.rate, TotalMs: totalMs, Ended: ended, Levels: &level}, audio.EncodeWAV(pcm, listen.rate))
+		case protocol.TypeAudioStop:
+			if listen == nil || m.ListenID != listen.id {
+				reply(protocol.Message{Type: protocol.TypeError, Err: "no such audio session"}, nil)
+				return
+			}
+			avail, _ := listen.available()
+			totalMs := int(avail * 1000 / int64(listen.rate))
+			listen = nil
+			reply(protocol.Message{Type: protocol.TypeStatus, DurationMs: totalMs, TotalMs: totalMs, Ended: true}, nil)
+		case protocol.TypeLevel:
+			duration, rate, err := protocol.NormalizeAudio(m.DurationMs, m.SampleRate, 1000, protocol.MaxChunkMs)
+			if err != nil {
+				reply(protocol.Message{Type: protocol.TypeError, Err: err.Error()}, nil)
+				return
+			}
+			pcm := fakeTonePCM(0, int64(duration*rate/1000), rate)
+			level := audio.Level(pcm)
+			reply(protocol.Message{Type: protocol.TypeLevels, DurationMs: duration, SampleRate: rate, Levels: &level}, nil)
 		default:
 			reply(protocol.Message{Type: protocol.TypeError, Err: "unknown request " + string(m.Type)}, nil)
 		}

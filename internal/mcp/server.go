@@ -33,6 +33,8 @@ type Server struct {
 	agent   *peer.Session
 	hubURL  string
 	pairing chan struct{} // non-nil while a code pairing waits for the user's Confirm tap
+	// audioListenID is the phone-side continuous listening session, if one is open.
+	audioListenID string
 }
 
 func Run(ctx context.Context, opt Options) error {
@@ -118,6 +120,36 @@ func Run(ctx context.Context, opt Options) error {
 	}, s.cameraZoom)
 
 	mcp.AddTool(server, &mcp.Tool{Name: "camera_configure", Description: "Configure focus, shutter duration/ISO, EV bias and white balance. Call camera_list first for supported controls/ranges. Switch lenses separately; omitted control groups stay unchanged. Unsupported settings return errors."}, s.cameraConfigure)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "audio_record",
+		Description: "Record a short clip (up to 60 seconds) from the paired phone's microphone and return it as WAV audio, with duration/loudness metadata. Use for one-off sounds such as a beep, a fan or a machine. For longer listening use audio_listen_start and audio_listen_next, which return chunks until you stop.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, Title: "Record audio"},
+	}, s.audioRecord)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "audio_listen_start",
+		Description: "Start continuous listening on the paired phone. The phone buffers audio, so call audio_listen_next whenever you are ready and nothing between calls is lost. Use audio_listen_stop when done. The phone shows a recording indicator while the session is open.",
+		Annotations: &mcp.ToolAnnotations{Title: "Start listening"},
+	}, s.audioListenStart)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "audio_listen_next",
+		Description: "Return the next chunk (default 10s, max 30s) of the active listening session as WAV audio. Call it again to keep listening; audio recorded while you were busy is buffered. ended=true means the session hit its maximum length or was stopped.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, Title: "Next audio chunk"},
+	}, s.audioListenNext)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "audio_listen_stop",
+		Description: "Stop the active continuous listening session and close the phone's microphone.",
+		Annotations: &mcp.ToolAnnotations{Title: "Stop listening"},
+	}, s.audioListenStop)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "audio_level",
+		Description: "Measure loudness for a short window (default 1s, max 30s) without returning audio. Returns RMS and peak dBFS plus a clipping flag. Cheap way to check whether a room, fan or machine is audible.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, Title: "Audio level"},
+	}, s.audioLevel)
 	log.Printf("mcp stdio hub=%s", s.hubURL)
 	return server.Run(ctx, &mcp.StdioTransport{})
 }
@@ -147,6 +179,22 @@ type zoomArgs struct {
 	Factor float64 `json:"factor" jsonschema:"zoom ratio, 1.0 is no zoom"`
 }
 
+type audioArgs struct {
+	DurationMs *int `json:"durationMs,omitempty" jsonschema:"clip length in milliseconds, default 5000, max 60000"`
+}
+
+type listenStartArgs struct {
+	MaxDurationMs *int `json:"maxDurationMs,omitempty" jsonschema:"session limit in milliseconds, default 600000, max 7200000; recording stops when it is reached"`
+}
+
+type listenNextArgs struct {
+	ChunkMs *int `json:"chunkMs,omitempty" jsonschema:"maximum chunk length in milliseconds, default 10000, max 30000"`
+}
+
+type levelArgs struct {
+	DurationMs *int `json:"durationMs,omitempty" jsonschema:"measurement window in milliseconds, default 1000, max 30000"`
+}
+
 func (s *Server) cameraStatus(ctx context.Context, _ *mcp.CallToolRequest, _ emptyArgs) (*mcp.CallToolResult, any, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -157,6 +205,7 @@ func (s *Server) cameraStatus(ctx context.Context, _ *mcp.CallToolRequest, _ emp
 		"listen":    "",
 		"linked":    cfg.Device != "",
 		"connected": false,
+		"listening": s.audioListenID != "",
 	}
 	if s.hub != nil {
 		out["listen"] = s.hub.ListenAddr()
@@ -231,6 +280,7 @@ func (s *Server) startPairing(hubURL, code string) (*mcp.CallToolResult, any, er
 func (s *Server) dropAgent() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.audioListenID = ""
 	if s.agent != nil {
 		_ = s.agent.Close()
 		s.agent = nil
@@ -251,12 +301,7 @@ func (s *Server) connect(ctx context.Context, hubURL string) (*peer.Session, err
 }
 
 func (s *Server) cameraDisconnect(ctx context.Context, _ *mcp.CallToolRequest, _ emptyArgs) (*mcp.CallToolResult, any, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.agent != nil {
-		_ = s.agent.Close()
-		s.agent = nil
-	}
+	s.dropAgent()
 	return textResult("disconnected"), nil, nil
 }
 
@@ -278,13 +323,206 @@ func (s *Server) cameraCapture(ctx context.Context, _ *mcp.CallToolRequest, args
 	if err != nil {
 		return errResult(err), nil, nil
 	}
-	meta := fmt.Sprintf("%dx%d facing=%s torch=%v zoom=%.2f bytes=%d", fr.Meta.Width, fr.Meta.Height, fr.Meta.Facing, fr.Meta.Torch, fr.Meta.Zoom, len(fr.JPEG))
+	meta := fmt.Sprintf("%dx%d facing=%s torch=%v zoom=%.2f bytes=%d", fr.Meta.Width, fr.Meta.Height, fr.Meta.Facing, fr.Meta.Torch, fr.Meta.Zoom, len(fr.Data))
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{
-			&mcp.ImageContent{Data: fr.JPEG, MIMEType: "image/jpeg"},
+			&mcp.ImageContent{Data: fr.Data, MIMEType: "image/jpeg"},
 			&mcp.TextContent{Text: meta},
 		},
-	}, map[string]any{"width": fr.Meta.Width, "height": fr.Meta.Height, "facing": fr.Meta.Facing, "torch": fr.Meta.Torch, "bytes": len(fr.JPEG), "cameraId": fr.Meta.CameraID, "settings": fr.Meta.Settings}, nil
+	}, map[string]any{"width": fr.Meta.Width, "height": fr.Meta.Height, "facing": fr.Meta.Facing, "torch": fr.Meta.Torch, "bytes": len(fr.Data), "cameraId": fr.Meta.CameraID, "settings": fr.Meta.Settings}, nil
+}
+
+func (s *Server) audioRecord(ctx context.Context, _ *mcp.CallToolRequest, args audioArgs) (*mcp.CallToolResult, any, error) {
+	sess, err := s.requireAgent(ctx)
+	if err != nil {
+		return errResult(err), nil, nil
+	}
+	// A one-shot clip replaces an open listening session: two sessions on one microphone
+	// would only confuse the agent and keep the indicator lit.
+	s.stopListening(sess)
+	duration := protocol.DefaultAudioMs
+	if args.DurationMs != nil {
+		duration = *args.DurationMs
+	}
+	if duration < 100 || duration > protocol.MaxOneShotAudioMs {
+		return errResult(fmt.Errorf("duration must be between 100 and %d ms", protocol.MaxOneShotAudioMs)), nil, nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, time.Duration(duration+15_000)*time.Millisecond)
+	defer cancel()
+	fr, err := sess.Listen(cctx, duration, 0)
+	if err != nil {
+		return errResult(err), nil, nil
+	}
+	return audioResult(fr), audioMeta(fr), nil
+}
+
+func (s *Server) audioListenStart(ctx context.Context, _ *mcp.CallToolRequest, args listenStartArgs) (*mcp.CallToolResult, any, error) {
+	sess, err := s.requireAgent(ctx)
+	if err != nil {
+		return errResult(err), nil, nil
+	}
+	s.stopListening(sess)
+	maxMs := protocol.DefaultSessionMs
+	if args.MaxDurationMs != nil {
+		maxMs = *args.MaxDurationMs
+	}
+	if maxMs < 0 || maxMs > protocol.MaxSessionMs {
+		return errResult(fmt.Errorf("max duration must be between 0 and %d ms", protocol.MaxSessionMs)), nil, nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	started, err := sess.AudioStart(cctx, maxMs, 0)
+	if err != nil {
+		return errResult(err), nil, nil
+	}
+	s.mu.Lock()
+	s.audioListenID = started.ListenID
+	s.mu.Unlock()
+	limit := "until stopped"
+	if started.MaxDurationMs > 0 {
+		limit = fmt.Sprintf("max %.1fs", float64(started.MaxDurationMs)/1000)
+	}
+	msg := fmt.Sprintf("listening (session %s, %s). Call audio_listen_next for the next chunk; the phone buffers audio between calls. Use audio_listen_stop when done.", started.ListenID, limit)
+	return textResult(msg), map[string]any{"listenId": started.ListenID, "sampleRate": started.SampleRate, "maxDurationMs": started.MaxDurationMs}, nil
+}
+
+func (s *Server) audioListenNext(ctx context.Context, _ *mcp.CallToolRequest, args listenNextArgs) (*mcp.CallToolResult, any, error) {
+	s.mu.Lock()
+	id := s.audioListenID
+	s.mu.Unlock()
+	if id == "" {
+		return errResult(fmt.Errorf("no active listening session: call audio_listen_start first")), nil, nil
+	}
+	sess, err := s.requireAgent(ctx)
+	if err != nil {
+		return errResult(err), nil, nil
+	}
+	chunk := protocol.DefaultChunkMs
+	if args.ChunkMs != nil {
+		chunk = *args.ChunkMs
+	}
+	if chunk < 100 || chunk > protocol.MaxChunkMs {
+		return errResult(fmt.Errorf("chunk must be between 100 and %d ms", protocol.MaxChunkMs)), nil, nil
+	}
+	// The phone fills the requested chunk in real time, so the call lasts about chunkMs.
+	cctx, cancel := context.WithTimeout(ctx, time.Duration(chunk+20_000)*time.Millisecond)
+	defer cancel()
+	fr, err := sess.AudioRead(cctx, id, chunk)
+	if err != nil {
+		return errResult(err), nil, nil
+	}
+	if fr.Meta.Ended {
+		s.mu.Lock()
+		if s.audioListenID == id {
+			s.audioListenID = ""
+		}
+		s.mu.Unlock()
+	}
+	if len(fr.Data) <= 44 { // a WAV header with no samples
+		b, _ := json.Marshal(fr.Meta)
+		return textResult("no new audio; session ended=" + fmt.Sprint(fr.Meta.Ended) + "\n" + string(b)), audioMeta(fr), nil
+	}
+	return audioResult(fr), audioMeta(fr), nil
+}
+
+func (s *Server) audioListenStop(ctx context.Context, _ *mcp.CallToolRequest, _ emptyArgs) (*mcp.CallToolResult, any, error) {
+	id := s.takeListenID()
+	if id == "" {
+		return errResult(fmt.Errorf("no active listening session")), nil, nil
+	}
+	sess, err := s.requireAgent(ctx)
+	if err != nil {
+		return errResult(err), nil, nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	meta, err := sess.AudioStop(cctx, id)
+	if err != nil {
+		return errResult(err), nil, nil
+	}
+	b, _ := json.MarshalIndent(meta, "", "  ")
+	return textResult(string(b)), meta, nil
+}
+
+func (s *Server) audioLevel(ctx context.Context, _ *mcp.CallToolRequest, args levelArgs) (*mcp.CallToolResult, any, error) {
+	sess, err := s.requireAgent(ctx)
+	if err != nil {
+		return errResult(err), nil, nil
+	}
+	// Level uses the one-shot path, which replaces any open session on the phone. Close the
+	// session here first so a later audio_listen_next cannot address a session that is gone.
+	s.stopListening(sess)
+	duration := 1000
+	if args.DurationMs != nil {
+		duration = *args.DurationMs
+	}
+	if duration < 100 || duration > protocol.MaxChunkMs {
+		return errResult(fmt.Errorf("duration must be between 100 and %d ms", protocol.MaxChunkMs)), nil, nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, time.Duration(duration+15_000)*time.Millisecond)
+	defer cancel()
+	fr, err := sess.Level(cctx, duration)
+	if err != nil {
+		return errResult(err), nil, nil
+	}
+	b, _ := json.MarshalIndent(fr.Meta, "", "  ")
+	return textResult(string(b)), fr.Meta, nil
+}
+
+// stopListening closes an open session, ignoring failures: the session may already be gone
+// with a phone that reconnected, and the next request would fail for the same reason anyway.
+func (s *Server) stopListening(sess *peer.Session) {
+	id := s.takeListenID()
+	if id == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, _ = sess.AudioStop(ctx, id)
+}
+
+func (s *Server) takeListenID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := s.audioListenID
+	s.audioListenID = ""
+	return id
+}
+
+func audioMeta(fr peer.Frame) map[string]any {
+	m := map[string]any{
+		"bytes":      len(fr.Data),
+		"mime":       fr.Meta.Mime,
+		"durationMs": fr.Meta.DurationMs,
+		"sampleRate": fr.Meta.SampleRate,
+		"totalMs":    fr.Meta.TotalMs,
+		"ended":      fr.Meta.Ended,
+	}
+	if fr.Meta.Levels != nil {
+		m["rmsDb"] = fr.Meta.Levels.RMSDB
+		m["peakDb"] = fr.Meta.Levels.PeakDB
+		m["clipping"] = fr.Meta.Levels.Clipping
+	}
+	return m
+}
+
+func audioResult(fr peer.Frame) *mcp.CallToolResult {
+	meta := fmt.Sprintf("duration=%.1fs sampleRate=%d bytes=%d", float64(fr.Meta.DurationMs)/1000, fr.Meta.SampleRate, len(fr.Data))
+	if fr.Meta.TotalMs > 0 {
+		meta += fmt.Sprintf(" total=%.1fs", float64(fr.Meta.TotalMs)/1000)
+	}
+	if fr.Meta.Levels != nil {
+		meta += fmt.Sprintf(" rms=%.1fdB peak=%.1fdB clipping=%v", fr.Meta.Levels.RMSDB, fr.Meta.Levels.PeakDB, fr.Meta.Levels.Clipping)
+	}
+	if fr.Meta.Ended {
+		meta += " ended=true"
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.AudioContent{Data: fr.Data, MIMEType: fr.Meta.Mime},
+			&mcp.TextContent{Text: meta},
+		},
+	}
 }
 
 func (s *Server) cameraList(ctx context.Context, _ *mcp.CallToolRequest, _ emptyArgs) (*mcp.CallToolResult, any, error) {

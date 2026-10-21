@@ -11,11 +11,13 @@ final class CameraHost: NSObject, ObservableObject, @unchecked Sendable {
     @Published var hubURL: String
     @Published var torchOn = false
     @Published var linked: Bool
+    @Published var recording = false
     @Published private(set) var forgettingAgent = false
     /// The SAS of a pairing waiting for the user to confirm or cancel.
     @Published var sas: String?
 
     let camera = Camera()
+    let audio = Audio()
     var session: AVCaptureSession { camera.session }
 
     private static let maxHubs = 4
@@ -68,12 +70,16 @@ final class CameraHost: NSObject, ObservableObject, @unchecked Sendable {
         saved = UserDefaults.standard.string(forKey: "hub") ?? ""
         hubURL = saved
         super.init()
+        audio.onRecording = { [weak self] on in
+            DispatchQueue.main.async { self?.recording = on }
+        }
     }
 
     func start() {
         guard !started else { return }
         started = true
         camera.onTorch = { [weak self] in self?.torchOn = $0 }
+        AVAudioApplication.requestRecordPermission { _ in }
         AVCaptureDevice.requestAccess(for: .video) { ok in
             DispatchQueue.main.async {
                 guard ok else {
@@ -258,7 +264,7 @@ final class CameraHost: NSObject, ObservableObject, @unchecked Sendable {
         let urls = s.order.compactMap(URL.init(string:))
         guard !urls.isEmpty else { return }
         dials += 1
-        let c = HubConnection(candidates: urls, identity: identity, camera: camera, host: self)
+        let c = HubConnection(candidates: urls, identity: identity, camera: camera, audio: audio, host: self)
         s.conn = c
         s.welcomed = false
         s.code = nil
@@ -345,7 +351,7 @@ final class CameraHost: NSObject, ObservableObject, @unchecked Sendable {
         }
         let hubs = live.values.filter(\.welcomed).count
         switch best {
-        case .agentLinked: status = "paired, agent can see this camera"
+        case .agentLinked: status = "paired, agent can see this camera and hear this microphone"
         case .agentConnecting: status = "agent connecting"
         case .refused: status = "refused an agent that could not prove the link"
         case .waiting: status = hubs > 1 ? "connected to \(hubs) hubs, waiting for the agent" : "connected, waiting for the agent"

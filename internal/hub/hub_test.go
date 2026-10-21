@@ -16,6 +16,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/Microck/ambivalence/internal/audio"
 	"github.com/Microck/ambivalence/internal/host"
 	"github.com/Microck/ambivalence/internal/hub"
 	"github.com/Microck/ambivalence/internal/link"
@@ -105,12 +106,62 @@ func TestPairAndCapture(t *testing.T) {
 	if err != nil {
 		t.Fatalf("capture: %v", err)
 	}
-	if img, err := jpeg.Decode(bytes.NewReader(fr.JPEG)); err != nil || img.Bounds().Dx() != 640 {
+	if img, err := jpeg.Decode(bytes.NewReader(fr.Data)); err != nil || img.Bounds().Dx() != 640 {
 		t.Fatalf("decode: %v", err)
 	}
 	on := true
 	if got, err := sess.Command(ctx, protocol.Message{TorchOn: &on}); err != nil || !got.Meta.Torch {
 		t.Fatalf("torch: %v", err)
+	}
+}
+
+// Audio travels like camera frames: sealed, binary, and only after the phone advertises support.
+// A short clip and a continuous session both return playable WAV chunks.
+func TestAudioClipAndSession(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	wsURL := startHub(t, ctx)
+	phone := host.NewPhone("test")
+	sess, _ := pair(t, ctx, phone, wsURL, serve(t, ctx, phone, wsURL))
+	defer sess.Close()
+
+	clip, err := sess.Listen(ctx, 300, 16000)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	pcm, err := audio.PCMFromWAV(clip.Data)
+	if err != nil || len(pcm) == 0 || clip.Meta.Mime != protocol.AudioMime {
+		t.Fatalf("clip: %v (%d bytes, mime %q)", err, len(pcm), clip.Meta.Mime)
+	}
+	if clip.Meta.Levels == nil || clip.Meta.Levels.PeakDB == -100 {
+		t.Fatalf("clip level: %+v", clip.Meta.Levels)
+	}
+
+	started, err := sess.AudioStart(ctx, 3000, 16000)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if started.ListenID == "" || started.Type != protocol.TypeAudioStarted {
+		t.Fatalf("started: %+v", started)
+	}
+	chunk, err := sess.AudioRead(ctx, started.ListenID, 250)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if pcm, err := audio.PCMFromWAV(chunk.Data); err != nil || len(pcm) == 0 {
+		t.Fatalf("chunk: %v (%d bytes)", err, len(pcm))
+	}
+	if chunk.Meta.Ended {
+		t.Fatal("session ended before its limit")
+	}
+	stopped, err := sess.AudioStop(ctx, started.ListenID)
+	if err != nil || stopped.Type != protocol.TypeStatus || stopped.TotalMs <= 0 {
+		t.Fatalf("stop: %v %+v", err, stopped)
+	}
+
+	level, err := sess.Level(ctx, 200)
+	if err != nil || level.Meta.Levels == nil || level.Meta.Type != protocol.TypeLevels {
+		t.Fatalf("level: %v %+v", err, level.Meta)
 	}
 }
 

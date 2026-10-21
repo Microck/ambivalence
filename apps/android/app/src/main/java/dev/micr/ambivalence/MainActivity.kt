@@ -49,6 +49,7 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
     private lateinit var pairCode: TextView
     private lateinit var status: TextView
     private lateinit var hint: TextView
+    private lateinit var rec: TextView
     private lateinit var hubUrl: EditText
     private lateinit var torchButton: Button
     private lateinit var confirmView: View
@@ -67,8 +68,13 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
     private var selectedId = ""
     private var configured = JSONObject()
 
+    private lateinit var audio: AudioRecorder
+
     // Agents on different hubs share one camera: one request at a time, in arrival order.
     private val cameraLock = Semaphore(1, true)
+    // Recording has its own lock: a read can block for the length of a chunk without holding
+    // up a camera capture, and the microphone is shared by every connection just like the camera.
+    private val audioLock = Semaphore(1, true)
 
     // Pairing confirmations from any connection, shown one at a time.
     private val confirms = ArrayDeque<Pair<String, CompletableFuture<Boolean>>>()
@@ -80,6 +86,7 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
         pairCode = findViewById(R.id.pair_code)
         status = findViewById(R.id.status)
         hint = findViewById(R.id.hint)
+        rec = findViewById(R.id.rec)
         hubUrl = findViewById(R.id.hub_url)
         torchButton = findViewById(R.id.torch)
         confirmView = findViewById(R.id.confirm)
@@ -87,6 +94,8 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
         hubs = Hubs(identity, this, this)
         discovery = HubDiscovery(this) { urls -> hubs.discovered(urls) }
         cameraExecutor = Executors.newSingleThreadExecutor()
+        audio = AudioRecorder(cacheDir)
+        audio.onRecording = { on -> runOnUiThread { rec.visibility = if (on) View.VISIBLE else View.GONE } }
         onChanged()
 
         hubUrl.setText(hubFrom(intent) ?: prefs.getString("hub", ""))
@@ -110,8 +119,13 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             startHosting()
+            // Upgrades from a camera-only install never saw the microphone prompt; ask now so
+            // the audio tools work without a trip to Settings.
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 8)
+            }
         } else {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 7)
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO), 7)
         }
     }
 
@@ -144,7 +158,7 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
         val c = if (::hubs.isInitialized) hubs.code() else null
         pairCode.text = c ?: "------"
         hint.text = when {
-            identity.key != null -> "linked: just ask your agent to use the camera"
+            identity.key != null -> "linked: just ask your agent to use the camera or microphone"
             c == null -> ""
             else -> "first time only, on the agent: ambivalence pair $c"
         }
@@ -183,8 +197,20 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+        if (requestCode == 8) { // microphone-only request after an upgrade
+            val micIdx = permissions.indexOf(Manifest.permission.RECORD_AUDIO)
+            if (micIdx < 0 || grantResults.getOrNull(micIdx) != PackageManager.PERMISSION_GRANTED) {
+                onNote("microphone permission denied (audio tools will fail)")
+            }
+            return
+        }
+        val cameraIdx = permissions.indexOf(Manifest.permission.CAMERA)
+        if (cameraIdx >= 0 && grantResults.getOrNull(cameraIdx) == PackageManager.PERMISSION_GRANTED) {
             startHosting()
+            val micIdx = permissions.indexOf(Manifest.permission.RECORD_AUDIO)
+            if (micIdx >= 0 && grantResults.getOrNull(micIdx) != PackageManager.PERMISSION_GRANTED) {
+                onNote("camera ready; microphone permission denied (audio tools will fail)")
+            }
         } else {
             onNote("camera permission denied")
         }
@@ -270,6 +296,45 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
     }
 
     private fun fail(msg: String): Nothing = throw IllegalStateException(msg)
+
+    // Audio work blocks the connection's inbox thread until the chunk is full, just like a
+    // capture blocks on the camera. The permission is checked per call so a user who revoked
+    // it in Settings gets a clear error instead of a silent empty recording.
+    private fun <T> withAudio(work: () -> T): T {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            fail("microphone permission denied; allow the microphone in Android Settings")
+        }
+        if (!audioLock.tryAcquire(30, TimeUnit.SECONDS)) fail("microphone busy")
+        try {
+            return work()
+        } finally {
+            audioLock.release()
+        }
+    }
+
+    override fun listen(durationMs: Int, sampleRate: Int): Pair<JSONObject, ByteArray> = withAudio {
+        audio.oneShot(durationMs.coerceIn(100, 60000), sampleRate)
+    }
+
+    override fun audioStart(maxDurationMs: Int, sampleRate: Int): JSONObject = withAudio {
+        audio.start(maxDurationMs.coerceIn(0, 7200000), sampleRate)
+    }
+
+    override fun audioRead(listenId: String, maxMs: Int): Pair<JSONObject, ByteArray> = withAudio {
+        audio.read(listenId, maxMs.coerceIn(100, 30000))
+    }
+
+    override fun audioStop(listenId: String?): JSONObject {
+        // An agent left: stop immediately even if a read is blocked holding the audio lock.
+        // AudioRecorder has its own lock, so this is safe and keeps the microphone from
+        // outliving the session.
+        if (listenId == null) return audio.stop(null)
+        return withAudio { audio.stop(listenId) }
+    }
+
+    override fun level(durationMs: Int, sampleRate: Int): JSONObject = withAudio {
+        audio.level(durationMs.coerceIn(100, 30000), sampleRate)
+    }
 
     override fun capture(quality: Int, maxWidth: Int): Pair<JSONObject, ByteArray> = withCamera { f ->
         val cap = imageCapture ?: fail("camera not ready")
@@ -414,8 +479,11 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
                         }
                     }
                 }
+                val caps = if (camera != null) manual().capabilities() else JSONObject().put("controlsVersion", 1)
+                caps.put("audioVersion", 1).put("audio", audioCapabilities())
                 f.complete(
-                    JSONObject().put("cameraId", selectedId).put("capabilities", if (camera != null) manual().capabilities() else JSONObject().put("controlsVersion", 1)).put("settings", JSONObject(configured.toString())).put("facing", if (camera != null) facingName(lensFacing) else "unknown").put("torch", torchOn).put("zoom", zoom).put("cameras", cams)
+                    JSONObject().put("cameraId", selectedId).put("capabilities", caps).put("settings", JSONObject(configured.toString())).put("facing", if (camera != null) facingName(lensFacing) else "unknown").put("torch", torchOn).put("zoom", zoom).put("cameras", cams)
+                        .put("audioVersion", 1).put("audio", audioCapabilities())
                         .put("host", JSONObject().put("name", "android").put("platform", "android")),
                 )
             } catch (e: Exception) {
@@ -457,6 +525,11 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
         } catch (e: Exception) { f.completeExceptionally(e) }
     }
 
+    private fun audioCapabilities(): JSONObject = JSONObject()
+        .put("version", 1).put("mime", "audio/wav").put("sampleRate", 16000)
+        .put("samples", JSONArray().put(16000)).put("maxOneShotMs", 60000)
+        .put("chunkMs", 10000).put("maxChunkMs", 30000).put("maxSessionMs", 7200000).put("levels", true)
+
     private fun facingName(f: Int) = when (f) {
         CameraSelector.LENS_FACING_FRONT -> "front"
         CameraSelector.LENS_FACING_BACK -> "back"
@@ -468,6 +541,7 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
         discovery.stop()
         hubs.stop()
         confirms.forEach { it.second.complete(false) }
+        runCatching { audio.stop(null) }
         cameraExecutor.shutdown()
     }
 }

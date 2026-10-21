@@ -97,6 +97,20 @@ class HubClientInteropTest {
             JSONObject().put("settings", controls ?: JSONObject()).put("facing", "back").put("cameraId", "back").put("torch", false).put("zoom", 1.0).put("connected", true)
         override fun capture(quality: Int, maxWidth: Int): Pair<JSONObject, ByteArray> =
             JSONObject().put("facing", "back").put("cameraId", "back").put("torch", false).put("zoom", 1.0).put("width", 4).put("height", 2) to jpeg
+
+        override fun listen(durationMs: Int, sampleRate: Int): Pair<JSONObject, ByteArray> =
+            JSONObject().put("mime", "audio/wav").put("durationMs", durationMs).put("sampleRate", sampleRate).put("levels", JSONObject().put("rmsDb", -100).put("peakDb", -100)) to ByteArray(44)
+
+        override fun audioStart(maxDurationMs: Int, sampleRate: Int): JSONObject =
+            JSONObject().put("listenId", "fake").put("sampleRate", sampleRate).put("maxDurationMs", maxDurationMs)
+
+        override fun audioRead(listenId: String, maxMs: Int): Pair<JSONObject, ByteArray> =
+            JSONObject().put("mime", "audio/wav").put("durationMs", 0).put("sampleRate", 16000).put("totalMs", 0).put("ended", true) to ByteArray(44)
+
+        override fun audioStop(listenId: String?): JSONObject = JSONObject().put("durationMs", 0).put("totalMs", 0).put("ended", true)
+
+        override fun level(durationMs: Int, sampleRate: Int): JSONObject =
+            JSONObject().put("durationMs", durationMs).put("sampleRate", sampleRate).put("levels", JSONObject().put("rmsDb", -100).put("peakDb", -100))
     }
 
     private class MemoryPrefs : SharedPreferences {

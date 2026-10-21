@@ -2,9 +2,9 @@
 //
 // Transport: JSON text frames on a WebSocket at /v1. The hub is an untrusted relay: after
 // hello it forwards messages between the host and its agent, handling only its own control
-// messages (ping from an unpaired client, and reject, which drops the agent). Camera traffic
-// travels as end-to-end sealed messages (TypeSealed); a sealed frame is followed by one binary
-// message holding the sealed JPEG. See package link and docs/protocol.md.
+// messages (ping from an unpaired client, and reject, which drops the agent). Camera and audio
+// traffic travels as end-to-end sealed messages (TypeSealed); a sealed frame is followed by one
+// binary message holding the sealed payload. See package link and docs/protocol.md.
 package protocol
 
 import (
@@ -24,6 +24,20 @@ const (
 	DefaultQuality  = 80
 	DefaultMaxWidth = 1280
 	MaxJPEGBytes    = 12 << 20
+
+	// Audio is mono 16-bit PCM in WAV. A one-shot clip is capped so one tool reply stays
+	// model-sized; longer listening uses a session whose chunks the agent pulls as it goes.
+	AudioMime              = "audio/wav"
+	DefaultAudioSampleRate = 16000
+	MinAudioSampleRate     = 8000
+	MaxAudioSampleRate     = 48000
+	DefaultAudioMs         = 5000
+	MaxOneShotAudioMs      = 60000
+	DefaultChunkMs         = 10000
+	MaxChunkMs             = 30000
+	DefaultSessionMs       = 10 * 60 * 1000
+	MaxSessionMs           = 2 * 60 * 60 * 1000
+	MaxAudioBytes          = 64 << 20
 
 	// ServiceType is the mDNS/Bonjour service a hub advertises on the local network.
 	ServiceType = "_ambivalence._tcp"
@@ -55,6 +69,15 @@ const (
 	TypeStatus  Type = "status"
 	TypeCommand Type = "command"
 	TypeCameras Type = "cameras"
+	// Audio: one-shot `listen`, or a session that records until stopped. `audio_read` drains
+	// audio recorded since the previous read; each chunk is a complete WAV file.
+	TypeListen       Type = "listen"
+	TypeAudioStart   Type = "audio_start"
+	TypeAudioStarted Type = "audio_started"
+	TypeAudioRead    Type = "audio_read"
+	TypeAudioStop    Type = "audio_stop"
+	TypeLevel        Type = "level"
+	TypeLevels       Type = "levels"
 	// Pairing and session auth between phone and agent; see package link. Hubs relay these
 	// like any other message and never hold a secret.
 	TypePair1  Type = "pair1"
@@ -66,7 +89,8 @@ const (
 	// TypeReject: phone tells the hub to drop an agent that failed auth, freeing the slot.
 	TypeReject Type = "reject"
 	// TypeSealed carries one end-to-end sealed message in Box (base64; see package link). A
-	// sealed frame is followed by a binary message that is itself a sealed box of the JPEG.
+	// sealed frame is followed by a binary message that is itself a sealed box of the payload
+	// (JPEG for images, WAV for audio).
 	TypeSealed Type = "sealed"
 )
 
@@ -102,6 +126,15 @@ type Message struct {
 	Torch    bool    `json:"torch,omitempty"`
 	Zoom     float64 `json:"zoom,omitempty"`
 
+	// Audio request/reply fields.
+	DurationMs    int         `json:"durationMs,omitempty"`
+	SampleRate    int         `json:"sampleRate,omitempty"`
+	ListenID      string      `json:"listenId,omitempty"`
+	MaxDurationMs int         `json:"maxDurationMs,omitempty"`
+	TotalMs       int         `json:"totalMs,omitempty"`
+	Ended         bool        `json:"ended,omitempty"`
+	Levels        *AudioLevel `json:"levels,omitempty"`
+
 	Controls     *Controls      `json:"controls,omitempty"`
 	Settings     map[string]any `json:"settings,omitempty"`
 	Capabilities map[string]any `json:"capabilities,omitempty"`
@@ -127,6 +160,48 @@ type Camera struct {
 type HostInfo struct {
 	Name     string `json:"name"`
 	Platform string `json:"platform"`
+}
+
+// AudioLevel describes one chunk of 16-bit PCM. dBFS is relative to full scale, floored at
+// -100 dB; Clipping means a sample hit the int16 limit.
+type AudioLevel struct {
+	RMSDB    float64 `json:"rmsDb"`
+	PeakDB   float64 `json:"peakDb"`
+	Clipping bool    `json:"clipping,omitempty"`
+}
+
+// NormalizeAudio validates a recording request. Zero values take the defaults; durations and
+// sample rates outside the supported range are rejected instead of silently clamped, so an
+// agent never thinks it recorded longer or at a different rate than it asked for.
+func NormalizeAudio(durationMs, sampleRate, defaultMs, maxMs int) (int, int, error) {
+	if sampleRate == 0 {
+		sampleRate = DefaultAudioSampleRate
+	}
+	if sampleRate < MinAudioSampleRate || sampleRate > MaxAudioSampleRate {
+		return 0, 0, fmt.Errorf("sample rate must be between %d and %d Hz", MinAudioSampleRate, MaxAudioSampleRate)
+	}
+	if durationMs == 0 {
+		durationMs = defaultMs
+	}
+	if durationMs < 100 || durationMs > maxMs {
+		return 0, 0, fmt.Errorf("duration must be between 100 and %d ms", maxMs)
+	}
+	return durationMs, sampleRate, nil
+}
+
+// AudioCapabilities is advertised by every host that can serve audio.
+func AudioCapabilities() map[string]any {
+	return map[string]any{
+		"version":      1,
+		"mime":         AudioMime,
+		"sampleRate":   DefaultAudioSampleRate,
+		"samples":      []int{DefaultAudioSampleRate},
+		"maxOneShotMs": MaxOneShotAudioMs,
+		"chunkMs":      DefaultChunkMs,
+		"maxChunkMs":   MaxChunkMs,
+		"maxSessionMs": MaxSessionMs,
+		"levels":       true,
+	}
 }
 
 func Encode(m Message) ([]byte, error) {

@@ -15,6 +15,7 @@ actor HubConnection {
     nonisolated let candidates: [URL]
     private let identity: Identity
     private let camera: Camera
+    private let audio: Audio
     private weak var host: CameraHost?
     private var task: URLSessionWebSocketTask?
     private var closed = false
@@ -40,10 +41,11 @@ actor HubConnection {
 
     private static let unauthenticated = "agent not authenticated"
 
-    init(candidates: [URL], identity: Identity, camera: Camera, host: CameraHost) {
+    init(candidates: [URL], identity: Identity, camera: Camera, audio: Audio, host: CameraHost) {
         self.candidates = candidates
         self.identity = identity
         self.camera = camera
+        self.audio = audio
         self.host = host
     }
 
@@ -188,7 +190,7 @@ actor HubConnection {
             await pair3(id, m)
         case "sealed":
             await sealed(id, m)
-        case "cameras", "command", "capture":
+        case "cameras", "command", "capture", "listen", "audio_start", "audio_read", "audio_stop", "level":
             // Unsealed camera requests never count, even after auth: a hub could inject them.
             sendError(id, HubConnection.unauthenticated)
         default:
@@ -288,10 +290,16 @@ actor HubConnection {
               inner["id"] as? String ?? "" == id else { return }
         do {
             var reply: [String: Any]
-            var jpeg: Data?
+            var payload: Data?
             switch inner["type"] as? String ?? "" {
             case "cameras":
                 reply = try await camera.cameras()
+                var caps = reply["capabilities"] as? [String: Any] ?? [:]
+                caps["audioVersion"] = 1
+                caps["audio"] = Audio.capabilities()
+                reply["capabilities"] = caps
+                reply["audioVersion"] = 1
+                reply["audio"] = Audio.capabilities()
             case "command":
                 let cam = (inner["camera"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                 reply = try await camera.command(camera: cam, torchOn: inner["torchOn"] as? Bool,
@@ -299,12 +307,41 @@ actor HubConnection {
  controls: inner["controls"] as? [String: Any])
             case "capture":
                 let q = (inner["quality"] as? NSNumber)?.intValue ?? 0, w = (inner["maxWidth"] as? NSNumber)?.intValue ?? 0
-                (reply, jpeg) = try await camera.capture(quality: q > 0 ? q : 80, maxWidth: w > 0 ? w : 1280)
+                (reply, payload) = try await camera.capture(quality: q > 0 ? q : 80, maxWidth: w > 0 ? w : 1280)
+            case "listen":
+                let ms = (inner["durationMs"] as? NSNumber)?.intValue ?? 0
+                let rate = (inner["sampleRate"] as? NSNumber)?.intValue ?? 0
+                let out = try await audio.oneShot(durationMs: min(60000, max(100, ms > 0 ? ms : 5000)),
+                                                  sampleRate: rate > 0 ? rate : 16000)
+                reply = out.meta
+                reply["type"] = "frame"
+                payload = out.wav
+            case "audio_start":
+                let max = (inner["maxDurationMs"] as? NSNumber)?.intValue ?? 0
+                let rate = (inner["sampleRate"] as? NSNumber)?.intValue ?? 0
+                reply = try audio.start(maxDurationMs: min(7200000, max(0, max)), sampleRate: rate > 0 ? rate : 16000)
+                reply["type"] = "audio_started"
+            case "audio_read":
+                let ms = (inner["durationMs"] as? NSNumber)?.intValue ?? 0
+                let out = try await audio.read(id: inner["listenId"] as? String ?? "",
+                                               maxMs: min(30000, max(100, ms > 0 ? ms : 10000)))
+                reply = out.meta
+                reply["type"] = "frame"
+                payload = out.wav
+            case "audio_stop":
+                reply = try audio.stop(id: inner["listenId"] as? String ?? "")
+                reply["type"] = "status"
+            case "level":
+                let ms = (inner["durationMs"] as? NSNumber)?.intValue ?? 0
+                let rate = (inner["sampleRate"] as? NSNumber)?.intValue ?? 0
+                reply = try await audio.level(durationMs: min(30000, max(100, ms > 0 ? ms : 1000)),
+                                              sampleRate: rate > 0 ? rate : 16000)
+                reply["type"] = "levels"
             default:
                 throw LinkError("unknown request \(inner["type"] as? String ?? "")")
             }
             reply["id"] = id
-            sendSealed(s, reply, jpeg: jpeg)
+            sendSealed(s, reply, payload: payload)
         } catch {
             sendSealed(s, ["type": "error", "id": id, "error": error.localizedDescription])
         }
@@ -318,6 +355,8 @@ actor HubConnection {
     }
 
     private func resetAgent() {
+        // Privacy: no microphone survives an agent leaving, reconnecting or being replaced.
+        audio.stopAll()
         agentHere = false
         seal = nil
         challenge = nil
@@ -342,15 +381,15 @@ actor HubConnection {
         send(["type": "error", "id": id, "error": err])
     }
 
-    /// Seals a reply and, for a frame, its JPEG as the next box. Nothing suspends between sealing
-    /// and enqueueing, and the socket sends in enqueue order, so sequence order is wire order.
-    private func sendSealed(_ s: Seal, _ obj: [String: Any], jpeg: Data? = nil) {
+    /// Seals a reply and, for a frame, its payload as the next box. Nothing suspends between
+    /// sealing and enqueueing, and the socket sends in enqueue order, so sequence order is wire order.
+    private func sendSealed(_ s: Seal, _ obj: [String: Any], payload: Data? = nil) {
         guard !closed else { return }
         guard let inner = HubConnection.encode(obj),
               let outer = HubConnection.encode(["type": "sealed", "id": obj["id"] as? String ?? "",
                                                 "box": s.tx.seal(Data(inner.utf8)).base64EncodedString()]) else { return }
         task?.send(.string(outer)) { _ in }
-        if let jpeg { task?.send(.data(s.tx.seal(jpeg))) { _ in } }
+        if let payload { task?.send(.data(s.tx.seal(payload))) { _ in } }
     }
 
     private static func encode(_ obj: [String: Any]) -> String? {
