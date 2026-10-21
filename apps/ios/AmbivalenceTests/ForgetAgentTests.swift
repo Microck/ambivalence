@@ -62,6 +62,26 @@ final class ForgetAgentTests: XCTestCase {
     }
 
     @MainActor
+    func testStaleAudioCleanupDoesNotDeactivateNewerSessionGeneration() async throws {
+        let audio = Audio()
+        var events: [Bool] = []
+        audio.onRecording = { events.append($0) }
+
+        let oldGen = audio.bumpSessionGenForTesting()
+        let newGen = audio.bumpSessionGenForTesting()
+
+        // Cleanup from oldGen arriving after newGen started must be ignored.
+        audio.audioFinished(gen: oldGen)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(events, [])
+
+        // Cleanup for the current generation still fires.
+        audio.audioFinished(gen: newGen)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(events, [false])
+    }
+
+    @MainActor
     func testForgetAgentRestoresUnlinkedStateAndKeepsHub() async throws {
         let defaults = UserDefaults.standard
         let previousHub = defaults.object(forKey: "hub")

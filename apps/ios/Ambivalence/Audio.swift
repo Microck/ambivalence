@@ -29,6 +29,9 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
     /// False while a session is live and its end has not been reported; guards the one-shot
     /// notification so the delegate and a read cannot both fire it.
     private var stopNotified = true
+    /// Bumped each time [start] begins activating a new session so a stale cleanup from a prior
+    /// session cannot deactivate AVAudioSession or clear the indicator for the new one.
+    private var sessionGen = 0
     /// Bumped whenever [stopAll] (or `stop(owner:id:nil)`) is called for an owner, so an
     /// asynchronous startup that has not yet published its recorder sees the departure and aborts.
     private var stopCounts: [String: Int] = [:]
@@ -62,13 +65,16 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
         guard isTokenValid(owner: owner, token: expectedToken) else {
             throw LinkError("audio session cancelled")
         }
-        stopAny() // a new recording preempts whatever session is live, whoever owns it
-        guard isTokenValid(owner: owner, token: expectedToken) else {
-            throw LinkError("audio session cancelled")
-        }
         guard AVAudioApplication.shared.recordPermission == .granted else {
             throw LinkError("microphone permission denied; allow it in Settings")
         }
+        stopAnyLocked() // a new recording preempts whatever session is live, whoever owns it
+        guard isTokenValid(owner: owner, token: expectedToken) else {
+            throw LinkError("audio session cancelled")
+        }
+        lock.lock()
+        sessionGen += 1
+        lock.unlock()
         let rate = min(48000, max(8000, sampleRate))
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("audio-\(UUID().uuidString).wav")
         let settings: [String: Any] = [
@@ -143,7 +149,7 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
         var want: UInt64 = 0
         while true {
             let s = try state(owner: owner, id: id)
-            if s.autoStopped { audioFinished() }
+            if s.autoStopped { audioFinished(gen: s.gen) }
             want = UInt64(chunkMs) * UInt64(s.rate) * 2 / 1000
             if s.available >= want || s.ended || Date() >= deadline { break }
             try await Task.sleep(nanoseconds: 20_000_000)
@@ -155,6 +161,7 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
     // never taken from an async context.
     private func drain(owner: String, id: String, want: UInt64) throws -> (meta: [String: Any], wav: Data) {
         var autoStopped = false
+        var gen = 0
         var out: (meta: [String: Any], wav: Data)!
         lock.lock()
         do {
@@ -177,7 +184,11 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
             }
             // The recorder may stop between the last state() poll and this drain; report it so
             // the indicator never outlives the microphone.
-            if !r.isRecording && !stopNotified { stopNotified = true; autoStopped = true }
+            if !r.isRecording && !stopNotified {
+                stopNotified = true
+                autoStopped = true
+                gen = sessionGen
+            }
             let ended = !r.isRecording && readOffset >= size
             let dataBytes = size > origin ? size - origin : 0
             let total = Int(dataBytes * 1000 / UInt64(rate * 2))
@@ -188,7 +199,7 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
             ]
             out = (meta, Self.wav(pcm, rate: rate))
         }
-        if autoStopped { audioFinished() }
+        if autoStopped { audioFinished(gen: gen) }
         return out
     }
 
@@ -238,9 +249,8 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
         _ = try? stop(owner: owner, id: nil)
     }
 
-    /// Stops whatever session is live, regardless of owner. Only for a new recording preempting
-    /// the old one.
-    private func stopAny() {
+    /// Stops whatever session is live, regardless of owner. Caller must hold [startLock].
+    private func stopAnyLocked() {
         lock.lock()
         guard let r = recorder else {
             lock.unlock()
@@ -248,16 +258,17 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
         }
         let result = detachLocked(r)
         lock.unlock()
-        finishDetach(result)
+        finishDetachLocked(result)
     }
 
     // Detaches the live session and computes its duration; the caller holds the lock. The
     // recorder is stopped and every handle cleared, so no read can find it afterwards.
-    private func detachLocked(_ r: AVAudioRecorder) -> (meta: [String: Any], url: URL?) {
+    private func detachLocked(_ r: AVAudioRecorder) -> (meta: [String: Any], url: URL?, gen: Int) {
         let origin = file.map(pcmOrigin) ?? 44
         let size = fileSize(file)
         let dataBytes = size > origin ? size - origin : 0
         let total = Int(dataBytes * 1000 / UInt64(rate * 2))
+        let gen = sessionGen
         stopNotified = true
         r.stop()
         recorder = nil
@@ -265,33 +276,61 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
         file = nil
         id = nil
         owner = nil
-        return (["durationMs": total, "totalMs": total, "ended": true], url)
+        return (["durationMs": total, "totalMs": total, "ended": true], url, gen)
     }
 
-    // Deactivates the session and clears the indicator; safe to call more than once for the same
-    // stop because [detachLocked] and the auto-stop guard both set stopNotified first.
-    private func finishDetach(_ result: (meta: [String: Any], url: URL?)) {
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    // Deactivates the session and clears the indicator only if no newer recording has started
+    // since [result.gen]; serialized with start() via [startLock] so a stale cleanup cannot
+    // deactivate a newly started session.
+    private func finishDetach(_ result: (meta: [String: Any], url: URL?, gen: Int)) {
         if let url = result.url { try? FileManager.default.removeItem(at: url) }
+        startLock.lock()
+        defer { startLock.unlock() }
+        deactivateIfCurrentLocked(gen: result.gen)
+    }
+
+    private func finishDetachLocked(_ result: (meta: [String: Any], url: URL?, gen: Int)) {
+        if let url = result.url { try? FileManager.default.removeItem(at: url) }
+        deactivateIfCurrentLocked(gen: result.gen)
+    }
+
+    private func deactivateIfCurrentLocked(gen: Int) {
+        lock.lock()
+        let current = (sessionGen == gen)
+        lock.unlock()
+        guard current else { return }
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         DispatchQueue.main.async { self.onRecording?(false) }
     }
 
     /// The recording stopped on its own (a timed one-shot or the app losing the microphone).
-    /// Deactivate and clear the indicator, but keep the file for the final drain.
-    private func audioFinished() {
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-        DispatchQueue.main.async { self.onRecording?(false) }
+    /// Deactivate and clear the indicator if no newer session has started, keeping the file for
+    /// the final drain.
+    func audioFinished(gen: Int) {
+        startLock.lock()
+        defer { startLock.unlock() }
+        deactivateIfCurrentLocked(gen: gen)
+    }
+
+    func bumpSessionGenForTesting() -> Int {
+        startLock.lock()
+        defer { startLock.unlock() }
+        lock.lock()
+        defer { lock.unlock() }
+        sessionGen += 1
+        return sessionGen
     }
 
     func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
         lock.lock()
         let mine = self.recorder === recorder && !stopNotified
+        let gen = sessionGen
         if mine { stopNotified = true }
         lock.unlock()
-        if mine { audioFinished() }
+        if mine { audioFinished(gen: gen) }
     }
 
-    private func state(owner: String, id: String) throws -> (available: UInt64, ended: Bool, rate: Int, autoStopped: Bool) {
+    private func state(owner: String, id: String) throws -> (available: UInt64, ended: Bool, rate: Int, autoStopped: Bool, gen: Int) {
         lock.lock()
         defer { lock.unlock() }
         guard let r = recorder, self.id == id, self.owner == owner, let url = file else {
@@ -308,7 +347,7 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
         }
         // No more audio will arrive once the recorder stops, so a partial final chunk is
         // delivered immediately instead of waiting out the deadline.
-        return (available, !r.isRecording, rate, autoStopped)
+        return (available, !r.isRecording, rate, autoStopped, sessionGen)
     }
 
     /// Byte offset of the PCM payload, cached per session. AVAudioRecorder may put extra chunks

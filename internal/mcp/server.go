@@ -347,10 +347,19 @@ func (s *Server) audioRecord(ctx context.Context, _ *mcp.CallToolRequest, args a
 	// A one-shot clip replaces an open listening session: two sessions on one microphone
 	// would only confuse the agent and keep the indicator lit.
 	s.stopListening(sess)
+	if !sess.Alive() {
+		sess, err = s.requireAgent(ctx)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+	}
 	cctx, cancel := context.WithTimeout(ctx, time.Duration(duration+15_000)*time.Millisecond)
 	defer cancel()
 	fr, err := sess.Listen(cctx, duration, 0)
 	if err != nil {
+		if cctx.Err() != nil || !sess.Alive() {
+			s.dropAgent()
+		}
 		return errResult(err), nil, nil
 	}
 	return audioResult(fr), audioMeta(fr), nil
@@ -369,10 +378,19 @@ func (s *Server) audioListenStart(ctx context.Context, _ *mcp.CallToolRequest, a
 		return errResult(err), nil, nil
 	}
 	s.stopListening(sess)
+	if !sess.Alive() {
+		sess, err = s.requireAgent(ctx)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+	}
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	started, err := sess.AudioStart(cctx, maxMs, 0)
 	if err != nil {
+		if cctx.Err() != nil || !sess.Alive() {
+			s.dropAgent()
+		}
 		return errResult(err), nil, nil
 	}
 	s.mu.Lock()
@@ -409,6 +427,9 @@ func (s *Server) audioListenNext(ctx context.Context, _ *mcp.CallToolRequest, ar
 	defer cancel()
 	fr, err := sess.AudioRead(cctx, id, chunk)
 	if err != nil {
+		if cctx.Err() != nil || !sess.Alive() {
+			s.dropAgent()
+		}
 		return errResult(err), nil, nil
 	}
 	if fr.Meta.Ended {
@@ -438,6 +459,9 @@ func (s *Server) audioListenStop(ctx context.Context, _ *mcp.CallToolRequest, _ 
 	defer cancel()
 	meta, err := sess.AudioStop(cctx, id)
 	if err != nil {
+		if cctx.Err() != nil || !sess.Alive() {
+			s.dropAgent()
+		}
 		return errResult(err), nil, nil
 	}
 	b, _ := json.MarshalIndent(meta, "", "  ")
@@ -459,10 +483,19 @@ func (s *Server) audioLevel(ctx context.Context, _ *mcp.CallToolRequest, args le
 	// Level uses the one-shot path, which replaces any open session on the phone. Close the
 	// session here first so a later audio_listen_next cannot address a session that is gone.
 	s.stopListening(sess)
+	if !sess.Alive() {
+		sess, err = s.requireAgent(ctx)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+	}
 	cctx, cancel := context.WithTimeout(ctx, time.Duration(duration+15_000)*time.Millisecond)
 	defer cancel()
 	fr, err := sess.Level(cctx, duration)
 	if err != nil {
+		if cctx.Err() != nil || !sess.Alive() {
+			s.dropAgent()
+		}
 		return errResult(err), nil, nil
 	}
 	b, _ := json.MarshalIndent(fr.Meta, "", "  ")
@@ -478,7 +511,9 @@ func (s *Server) stopListening(sess *peer.Session) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, _ = sess.AudioStop(ctx, id)
+	if _, err := sess.AudioStop(ctx, id); err != nil && (ctx.Err() != nil || !sess.Alive()) {
+		s.dropAgent()
+	}
 }
 
 func (s *Server) takeListenID() string {

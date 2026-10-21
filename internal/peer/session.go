@@ -201,7 +201,13 @@ func (s *Session) Listen(ctx context.Context, durationMs, sampleRate int) (Frame
 	if err := s.requireAudio(ctx); err != nil {
 		return Frame{}, err
 	}
-	return s.call(ctx, protocol.Message{Type: protocol.TypeListen, DurationMs: durationMs, SampleRate: sampleRate})
+	fr, err := s.call(ctx, protocol.Message{Type: protocol.TypeListen, DurationMs: durationMs, SampleRate: sampleRate})
+	if err != nil && ctx.Err() != nil {
+		// Tear down the agent socket so the hub sends a departure notice and cancels any
+		// in-flight microphone prompt or recording on the phone.
+		_ = s.Close()
+	}
+	return fr, err
 }
 
 // AudioStart begins continuous recording. The phone buffers audio until AudioRead drains it,
@@ -221,9 +227,16 @@ func (s *Session) AudioStart(ctx context.Context, maxDurationMs, sampleRate int)
 	}
 	fr, err := s.call(ctx, protocol.Message{Type: protocol.TypeAudioStart, MaxDurationMs: maxDurationMs, SampleRate: sampleRate})
 	if err != nil {
+		if ctx.Err() != nil {
+			// If start timed out while the phone was still awaiting microphone permission, closing
+			// the session makes the hub send a departure notice so a later approval cannot start
+			// an untracked recording.
+			_ = s.Close()
+		}
 		return protocol.Message{}, err
 	}
 	if fr.Meta.Type != protocol.TypeAudioStarted || fr.Meta.ListenID == "" {
+		_ = s.Close()
 		return protocol.Message{}, fmt.Errorf("phone did not start an audio session")
 	}
 	return fr.Meta, nil
@@ -265,7 +278,11 @@ func (s *Session) Level(ctx context.Context, durationMs int) (Frame, error) {
 	if err := s.requireAudio(ctx); err != nil {
 		return Frame{}, err
 	}
-	return s.call(ctx, protocol.Message{Type: protocol.TypeLevel, DurationMs: durationMs, SampleRate: sampleRate})
+	fr, err := s.call(ctx, protocol.Message{Type: protocol.TypeLevel, DurationMs: durationMs, SampleRate: sampleRate})
+	if err != nil && ctx.Err() != nil {
+		_ = s.Close()
+	}
+	return fr, err
 }
 
 // requireAudio asks the phone what it supports before sending audio requests. Older hosts
