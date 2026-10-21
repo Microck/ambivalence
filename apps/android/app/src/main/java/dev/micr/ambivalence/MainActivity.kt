@@ -312,28 +312,28 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
         }
     }
 
-    override fun listen(durationMs: Int, sampleRate: Int): Pair<JSONObject, ByteArray> = withAudio {
-        audio.oneShot(durationMs.coerceIn(100, 60000), sampleRate)
+    override fun listen(owner: String, durationMs: Int, sampleRate: Int): Pair<JSONObject, ByteArray> = withAudio {
+        audio.oneShot(owner, durationMs.coerceIn(100, 60000), sampleRate)
     }
 
-    override fun audioStart(maxDurationMs: Int, sampleRate: Int): JSONObject = withAudio {
-        audio.start(maxDurationMs.coerceIn(0, 7200000), sampleRate)
+    override fun audioStart(owner: String, maxDurationMs: Int, sampleRate: Int): JSONObject = withAudio {
+        audio.start(owner, maxDurationMs.coerceIn(0, 7200000), sampleRate)
     }
 
-    override fun audioRead(listenId: String, maxMs: Int): Pair<JSONObject, ByteArray> = withAudio {
-        audio.read(listenId, maxMs.coerceIn(100, 30000))
+    override fun audioRead(owner: String, listenId: String, maxMs: Int): Pair<JSONObject, ByteArray> = withAudio {
+        audio.read(owner, listenId, maxMs.coerceIn(100, 30000))
     }
 
-    override fun audioStop(listenId: String?): JSONObject {
+    override fun audioStop(owner: String, listenId: String?): JSONObject {
         // An agent left: stop immediately even if a read is blocked holding the audio lock.
         // AudioRecorder has its own lock, so this is safe and keeps the microphone from
         // outliving the session.
-        if (listenId == null) return audio.stop(null)
-        return withAudio { audio.stop(listenId) }
+        if (listenId == null) return audio.stop(owner, null)
+        return withAudio { audio.stop(owner, listenId) }
     }
 
-    override fun level(durationMs: Int, sampleRate: Int): JSONObject = withAudio {
-        audio.level(durationMs.coerceIn(100, 30000), sampleRate)
+    override fun level(owner: String, durationMs: Int, sampleRate: Int): JSONObject = withAudio {
+        audio.level(owner, durationMs.coerceIn(100, 30000), sampleRate)
     }
 
     override fun capture(quality: Int, maxWidth: Int): Pair<JSONObject, ByteArray> = withCamera { f ->
@@ -536,12 +536,19 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
         else -> "external"
     }
 
+    override fun onStop() {
+        super.onStop()
+        // Android 9+ hands a backgrounded app silence, not an error, and the recording
+        // indicator is not visible. End the session instead of streaming silent chunks.
+        runCatching { audio.stopAny() }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         discovery.stop()
         hubs.stop()
         confirms.forEach { it.second.complete(false) }
-        runCatching { audio.stop(null) }
+        runCatching { audio.stopAny() }
         cameraExecutor.shutdown()
     }
 }

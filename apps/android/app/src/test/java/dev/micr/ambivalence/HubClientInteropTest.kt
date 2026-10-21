@@ -47,7 +47,8 @@ class HubClientInteropTest {
             }
             // The first candidate refuses connections, like a hub address on another LAN; the client must move on.
             val dead = ServerSocket(0).use { it.localPort }
-            val client = HubClient(listOf("ws://127.0.0.1:$dead/v1", url), identity, FakeCamera(), events)
+            val camera = FakeCamera()
+            val client = HubClient(listOf("ws://127.0.0.1:$dead/v1", url), identity, camera, events)
             client.start()
             val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
             while (client.code == null && System.nanoTime() < deadline) Thread.sleep(50)
@@ -72,7 +73,9 @@ class HubClientInteropTest {
             assertEquals(configured.first, 0, configured.second)
             assertTrue(configured.first, configured.first.contains("focusPosition"))
             assertTrue(configured.first, configured.first.contains("0.008"))
+            val stopsBefore = camera.audioStopCalls
             client.disconnect()
+            assertTrue("disconnect stops this connection's microphone", camera.audioStopCalls > stopsBefore)
         } finally {
             hub.destroy()
         }
@@ -90,6 +93,8 @@ class HubClientInteropTest {
     }
 
     private inner class FakeCamera : CameraHost {
+        @Volatile var audioStopCalls = 0
+        @Volatile var lastStopOwner: String? = null
         override fun cameras(): JSONObject = JSONObject().put("capabilities", JSONObject().put("controlsVersion", 1)).put("facing", "back").put("torch", false).put("zoom", 1.0)
             .put("cameras", JSONArray().put(JSONObject().put("id", "fake-back").put("facing", "back").put("torch", false).put("minZoom", 1).put("maxZoom", 1)))
             .put("host", JSONObject().put("name", "android").put("platform", "android"))
@@ -98,18 +103,22 @@ class HubClientInteropTest {
         override fun capture(quality: Int, maxWidth: Int): Pair<JSONObject, ByteArray> =
             JSONObject().put("facing", "back").put("cameraId", "back").put("torch", false).put("zoom", 1.0).put("width", 4).put("height", 2) to jpeg
 
-        override fun listen(durationMs: Int, sampleRate: Int): Pair<JSONObject, ByteArray> =
+        override fun listen(owner: String, durationMs: Int, sampleRate: Int): Pair<JSONObject, ByteArray> =
             JSONObject().put("mime", "audio/wav").put("durationMs", durationMs).put("sampleRate", sampleRate).put("levels", JSONObject().put("rmsDb", -100).put("peakDb", -100)) to ByteArray(44)
 
-        override fun audioStart(maxDurationMs: Int, sampleRate: Int): JSONObject =
+        override fun audioStart(owner: String, maxDurationMs: Int, sampleRate: Int): JSONObject =
             JSONObject().put("listenId", "fake").put("sampleRate", sampleRate).put("maxDurationMs", maxDurationMs)
 
-        override fun audioRead(listenId: String, maxMs: Int): Pair<JSONObject, ByteArray> =
+        override fun audioRead(owner: String, listenId: String, maxMs: Int): Pair<JSONObject, ByteArray> =
             JSONObject().put("mime", "audio/wav").put("durationMs", 0).put("sampleRate", 16000).put("totalMs", 0).put("ended", true) to ByteArray(44)
 
-        override fun audioStop(listenId: String?): JSONObject = JSONObject().put("durationMs", 0).put("totalMs", 0).put("ended", true)
+        override fun audioStop(owner: String, listenId: String?): JSONObject {
+            audioStopCalls++
+            lastStopOwner = owner
+            return JSONObject().put("durationMs", 0).put("totalMs", 0).put("ended", true)
+        }
 
-        override fun level(durationMs: Int, sampleRate: Int): JSONObject =
+        override fun level(owner: String, durationMs: Int, sampleRate: Int): JSONObject =
             JSONObject().put("durationMs", durationMs).put("sampleRate", sampleRate).put("levels", JSONObject().put("rmsDb", -100).put("peakDb", -100))
     }
 

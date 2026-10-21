@@ -301,6 +301,10 @@
 
   const showRec = (on) => { $("rec").hidden = !on; };
   const audioError = "the microphone needs HTTPS and permission; open the https:// tunnel URL and allow the microphone";
+  // A session can run for hours, but audio nobody drains must not grow without bound. An agent
+  // that has not read for a minute is not listening: end the session, let it drain what is
+  // buffered, and start another. 60 s of Float32 at 48 kHz is about 11 MB.
+  const MAX_UNREAD_MS = 60000;
 
   // A SCRIPTPROCESSOR still works on every mobile browser; AudioWorklet would add a module
   // loading step for no benefit at 16 kHz. Frames stay Float32 until a read resamples them.
@@ -316,13 +320,18 @@
     const sink = ctx.createGain();
     sink.gain.value = 0; // keep the graph alive without playing the mic back
     const s = { id: toHex(rand(8)), mic, ctx, source, proc, sink, rate: ctx.sampleRate,
-      chunks: [], frames: 0, read: 0, maxMs: maxDurationMs || 0, ended: false, halted: false };
+      chunks: [], frames: 0, read: 0, maxMs: maxDurationMs || 0, ended: false, halted: false,
+      maxUnread: Math.round(ctx.sampleRate * MAX_UNREAD_MS / 1000) };
     proc.onaudioprocess = (ev) => {
       if (s.ended) return;
       const input = ev.inputBuffer.getChannelData(0);
       s.chunks.push(new Float32Array(input));
       s.frames += input.length;
       if (s.maxMs > 0 && s.frames >= s.rate * s.maxMs / 1000) {
+        s.ended = true;
+        setTimeout(() => haltMic(s), 0);
+      } else if (s.frames - s.read > s.maxUnread) {
+        // Nobody is draining the queue: stop recording instead of growing the heap forever.
         s.ended = true;
         setTimeout(() => haltMic(s), 0);
       }
@@ -542,11 +551,15 @@
       case "listen": {
         const ms = Math.max(100, Math.min(60000, m.durationMs || 5000));
         const live = await startListening(ms);
-        const got = await readAudio(live, ms);
-        await haltListening();
-        const out = encodeAudio(got.floats, got.rate);
-        return sendSealed(s, { ...state(m.id, "frame"), mime: "audio/wav", bytes: out.wav.byteLength,
-          durationMs: out.durationMs, sampleRate: 16000, totalMs: got.totalMs, ended: true, levels: out.level }, out.wav);
+        try {
+          const got = await readAudio(live, ms);
+          const out = encodeAudio(got.floats, got.rate);
+          return sendSealed(s, { ...state(m.id, "frame"), mime: "audio/wav", bytes: out.wav.byteLength,
+            durationMs: out.durationMs, sampleRate: 16000, totalMs: got.totalMs, ended: true, levels: out.level }, out.wav);
+        } finally {
+          // Even a failed read must not leave the microphone on.
+          await haltListening();
+        }
       }
       case "audio_start": {
         const ms = m.maxDurationMs || 0;
@@ -573,11 +586,15 @@
       case "level": {
         const ms = Math.max(100, Math.min(30000, m.durationMs || 1000));
         const live = await startListening(ms);
-        const got = await readAudio(live, ms);
-        await haltListening();
-        const out = encodeAudio(got.floats, got.rate);
-        return sendSealed(s, { ...state(m.id, "levels"), durationMs: ms, sampleRate: 16000,
-          levels: out.level });
+        try {
+          const got = await readAudio(live, ms);
+          const out = encodeAudio(got.floats, got.rate);
+          return sendSealed(s, { ...state(m.id, "levels"), durationMs: ms, sampleRate: 16000,
+            levels: out.level });
+        } finally {
+          // Even a failed read must not leave the microphone on.
+          await haltListening();
+        }
       }
       default: throw new Error("unknown request " + m.type);
     }

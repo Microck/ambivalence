@@ -28,7 +28,7 @@ class AudioRecorder(private val dir: File) {
     private val lock = Any()
     private var session: Session? = null
 
-    private class Session(val id: String, val file: File, val rate: Int, val maxBytes: Long) {
+    private class Session(val id: String, val owner: String, val file: File, val rate: Int, val maxBytes: Long) {
         @Volatile var written = 0L
         @Volatile var readOffset = 0L
         @Volatile var ended = false
@@ -40,7 +40,7 @@ class AudioRecorder(private val dir: File) {
         var deletePending = false
     }
 
-    fun start(maxDurationMs: Int, sampleRate: Int): JSONObject {
+    fun start(owner: String, maxDurationMs: Int, sampleRate: Int): JSONObject {
         stopLocked() // finishes the old session before taking the lock for the new one
         synchronized(lock) {
             val rate = sampleRate.coerceIn(8000, 48000)
@@ -56,7 +56,7 @@ class AudioRecorder(private val dir: File) {
                 rec.release()
                 throw IllegalStateException("microphone unavailable")
             }
-            val s = Session(id, file, rate, max(0, maxDurationMs).toLong() * rate * 2 / 1000)
+            val s = Session(id, owner, file, rate, max(0, maxDurationMs).toLong() * rate * 2 / 1000)
             s.record = rec
             val out = FileOutputStream(file)
             rec.startRecording()
@@ -93,15 +93,15 @@ class AudioRecorder(private val dir: File) {
         }
     }
 
-    fun read(id: String, maxMs: Int): Pair<JSONObject, ByteArray> =
-        readChunk(id, maxMs.coerceIn(100, 30000))
+    fun read(owner: String, id: String, maxMs: Int): Pair<JSONObject, ByteArray> =
+        readChunk(owner, id, maxMs.coerceIn(100, 30000))
 
     // chunkMs may exceed the protocol chunk cap for a one-shot clip: there the whole clip is
     // wanted in one reply, and the recorder stops on its own at that length.
-    private fun readChunk(id: String, chunkMs: Int): Pair<JSONObject, ByteArray> {
+    private fun readChunk(owner: String, id: String, chunkMs: Int): Pair<JSONObject, ByteArray> {
         val s = synchronized(lock) {
             val cur = session ?: throw IllegalStateException("no such audio session")
-            if (cur.id != id) throw IllegalStateException("no such audio session")
+            if (cur.id != id || cur.owner != owner) throw IllegalStateException("no such audio session")
             cur.readers++
             cur
         }
@@ -145,39 +145,55 @@ class AudioRecorder(private val dir: File) {
     }
 
     /** Records one whole clip; the session limit is the clip length. */
-    fun oneShot(durationMs: Int, sampleRate: Int): Pair<JSONObject, ByteArray> {
-        val started = start(durationMs, sampleRate)
+    fun oneShot(owner: String, durationMs: Int, sampleRate: Int): Pair<JSONObject, ByteArray> {
+        val started = start(owner, durationMs, sampleRate)
         val id = started.getString("listenId")
         return try {
-            val (meta, pcm) = readChunk(id, durationMs.coerceIn(100, 60000))
+            val (meta, pcm) = readChunk(owner, id, durationMs.coerceIn(100, 60000))
             meta.put("durationMs", durationMs) to pcm
         } finally {
             // Also covers an agent that left mid-clip and pulled the session out from under us.
-            runCatching { stop(id) }
+            runCatching { stop(owner, id) }
         }
     }
 
     /** Measures the same signal a clip would contain, without returning the audio. */
-    fun level(durationMs: Int, sampleRate: Int): JSONObject {
-        val started = start(durationMs, sampleRate)
+    fun level(owner: String, durationMs: Int, sampleRate: Int): JSONObject {
+        val started = start(owner, durationMs, sampleRate)
         val id = started.getString("listenId")
         return try {
-            val (meta, wavBytes) = readChunk(id, durationMs.coerceIn(100, 60000))
+            val (meta, wavBytes) = readChunk(owner, id, durationMs.coerceIn(100, 60000))
             val pcm = wavBytes.copyOfRange(44, wavBytes.size)
             JSONObject().put("durationMs", durationMs).put("sampleRate", meta.optInt("sampleRate")).put("levels", levels(pcm))
         } finally {
-            runCatching { stop(id) }
+            runCatching { stop(owner, id) }
         }
     }
 
     /**
-     * Stops the session with [id], or any session when null (the agent left). Safe to call from
-     * a connection thread while another thread is blocked in read.
+     * Stops [owner]'s session with [id], or any session owned by [owner] when null (the agent
+     * left). Another connection's session is left untouched. Safe to call from a connection
+     * thread while another thread is blocked in read.
      */
-    fun stop(id: String?): JSONObject {
+    fun stop(owner: String, id: String?): JSONObject {
         val s = synchronized(lock) {
             val cur = session ?: throw IllegalStateException("no such audio session")
-            if (id != null && cur.id != id) throw IllegalStateException("no such audio session")
+            if (cur.owner != owner || (id != null && cur.id != id)) throw IllegalStateException("no such audio session")
+            session = null
+            cur.stopping = true
+            cur.ended = true
+            runCatching { cur.record?.stop() }
+            cur
+        }
+        finish(s)
+        val totalMs = (s.written * 1000 / (s.rate * 2)).toInt()
+        return JSONObject().put("durationMs", totalMs).put("totalMs", totalMs).put("ended", true)
+    }
+
+    /** Stops whatever session is active, regardless of owner. Only for app teardown. */
+    fun stopAny(): JSONObject {
+        val s = synchronized(lock) {
+            val cur = session ?: throw IllegalStateException("no such audio session")
             session = null
             cur.stopping = true
             cur.ended = true

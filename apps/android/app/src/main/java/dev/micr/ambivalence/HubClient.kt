@@ -41,19 +41,22 @@ interface CameraHost {
     fun command(camera: String?, torchOn: Boolean?, zoom: Double?, controls: JSONObject? = null): JSONObject
     fun capture(quality: Int, maxWidth: Int): Pair<JSONObject, ByteArray>
 
-    /** One clip, capped by the agent at 60 s. Returns metadata and a WAV file. */
-    fun listen(durationMs: Int, sampleRate: Int): Pair<JSONObject, ByteArray>
+    /**
+     * One clip, capped by the agent at 60 s. Returns metadata and a WAV file. [owner] is the
+     * connection that started it; another connection's session is never touched.
+     */
+    fun listen(owner: String, durationMs: Int, sampleRate: Int): Pair<JSONObject, ByteArray>
 
     /** Starts continuous recording; a zero max means until stop. */
-    fun audioStart(maxDurationMs: Int, sampleRate: Int): JSONObject
+    fun audioStart(owner: String, maxDurationMs: Int, sampleRate: Int): JSONObject
 
     /** Drains audio recorded since the previous call, waiting up to maxMs for it. */
-    fun audioRead(listenId: String, maxMs: Int): Pair<JSONObject, ByteArray>
+    fun audioRead(owner: String, listenId: String, maxMs: Int): Pair<JSONObject, ByteArray>
 
-    /** Stops the session with this id, or any session when null (agent left). */
-    fun audioStop(listenId: String?): JSONObject
+    /** Stops [owner]'s session with this id, or any session owned by [owner] when null (agent left). */
+    fun audioStop(owner: String, listenId: String?): JSONObject
 
-    fun level(durationMs: Int, sampleRate: Int): JSONObject
+    fun level(owner: String, durationMs: Int, sampleRate: Int): JSONObject
 }
 
 /**
@@ -71,6 +74,12 @@ class HubClient(
 ) {
     /** Stable name of this hub entry: its first candidate. */
     val url = candidates.first()
+
+    /**
+     * This connection's audio ownership token. The recorder only stops sessions carrying its
+     * owner, so a reset or socket loss on one hub never silences another hub's recording.
+     */
+    private val owner = Link.hex(Link.nonce()).take(12)
 
     interface Events {
         fun changed()
@@ -122,11 +131,21 @@ class HubClient(
 
     fun disconnect() {
         stopped = true
+        stopAudio()
         pendingConfirm?.complete(false)
         socket?.close(1000, "bye")
         socket = null
         live = false
         inbox.shutdownNow()
+    }
+
+    /**
+     * Stops this connection's recording. Safe from an OkHttp callback: the recorder has its own
+     * lock, so a thread blocked in audio_read still wakes within one poll instead of holding the
+     * microphone for the rest of the chunk.
+     */
+    private fun stopAudio() {
+        runCatching { camera.audioStop(owner, null) }
     }
 
     private fun open() {
@@ -142,10 +161,13 @@ class HubClient(
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                // The inbox may be blocked on the pairing screen; an agent leaving cancels it.
-                pendingConfirm?.let { p ->
-                    val m = runCatching { JSONObject(text) }.getOrNull()
-                    if (m?.optString("type") == "status" && !m.optBoolean("connected")) dismissConfirm()
+                // The inbox may be blocked on the pairing screen or in an audio read; act on the
+                // socket thread so an agent leaving cancels the prompt and stops our microphone
+                // without queueing behind a chunk that can run for up to 30 s.
+                val m = runCatching { JSONObject(text) }.getOrNull()
+                if (webSocket === socket && m?.optString("type") == "status" && !m.optBoolean("connected")) {
+                    if (pendingConfirm != null) dismissConfirm()
+                    stopAudio()
                 }
                 post { if (webSocket === socket) handle(text) }
             }
@@ -169,7 +191,10 @@ class HubClient(
 
     // Callbacks can fire before open() has stored the socket; the inbox runs after it, in order.
     private fun lost(ws: WebSocket) {
-        if (ws === socket) dismissConfirm() // the inbox may be blocked on it
+        if (ws === socket) { // the inbox may be blocked on the prompt or in an audio read
+            dismissConfirm()
+            stopAudio()
+        }
         post {
             if (ws !== socket || stopped) return@post
             socket = null
@@ -234,7 +259,7 @@ class HubClient(
 
     private fun resetAgent(present: Boolean) {
         // Privacy: no microphone survives an agent leaving, reconnecting or being replaced.
-        runCatching { camera.audioStop(null) }
+        stopAudio()
         agentHere = present
         seal = null
         challenge = null
@@ -375,29 +400,29 @@ class HubClient(
                 "listen" -> {
                     val ms = m.optInt("durationMs").takeIf { it > 0 } ?: DEFAULT_AUDIO_MS
                     val rate = m.optInt("sampleRate").takeIf { it > 0 } ?: DEFAULT_SAMPLE_RATE
-                    val (meta, wav) = camera.listen(ms, rate)
+                    val (meta, wav) = camera.listen(owner, ms, rate)
                     meta.put("type", "frame").put("id", id).put("mime", "audio/wav").put("bytes", wav.size)
                     sendSealed(s, meta, wav)
                 }
                 "audio_start" -> {
                     val max = m.optInt("maxDurationMs")
                     val rate = m.optInt("sampleRate").takeIf { it > 0 } ?: DEFAULT_SAMPLE_RATE
-                    sendSealed(s, camera.audioStart(max, rate).put("type", "audio_started").put("id", id))
+                    sendSealed(s, camera.audioStart(owner, max, rate).put("type", "audio_started").put("id", id))
                 }
                 "audio_read" -> {
                     val ms = (m.optInt("durationMs").takeIf { it > 0 } ?: DEFAULT_CHUNK_MS).coerceIn(100, MAX_CHUNK_MS)
-                    val (meta, wav) = camera.audioRead(m.optString("listenId"), ms)
+                    val (meta, wav) = camera.audioRead(owner, m.optString("listenId"), ms)
                     meta.put("type", "frame").put("id", id).put("mime", "audio/wav").put("bytes", wav.size)
                     sendSealed(s, meta, wav)
                 }
                 "audio_stop" -> {
-                    val meta = camera.audioStop(m.optString("listenId").takeIf { it.isNotEmpty() })
+                    val meta = camera.audioStop(owner, m.optString("listenId").takeIf { it.isNotEmpty() })
                     sendSealed(s, meta.put("type", "status").put("id", id))
                 }
                 "level" -> {
                     val ms = (m.optInt("durationMs").takeIf { it > 0 } ?: 1000).coerceIn(100, MAX_CHUNK_MS)
                     val rate = m.optInt("sampleRate").takeIf { it > 0 } ?: DEFAULT_SAMPLE_RATE
-                    sendSealed(s, camera.level(ms, rate).put("type", "levels").put("id", id))
+                    sendSealed(s, camera.level(owner, ms, rate).put("type", "levels").put("id", id))
                 }
                 else -> sendSealed(s, JSONObject().put("type", "error").put("id", id).put("error", "unknown request $type"))
             }

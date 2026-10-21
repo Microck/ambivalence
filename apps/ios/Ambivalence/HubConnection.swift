@@ -11,6 +11,9 @@ actor HubConnection {
     }
 
     nonisolated let id = UUID()
+    /// This connection's audio ownership token. Only sessions it started are stopped on a
+    /// departure, a socket loss or a reset, so another hub's churn cannot silence its recording.
+    private var owner: String { id.uuidString }
     /// Addresses of one hub, tried in order; a discovered multihomed hub may list several.
     nonisolated let candidates: [URL]
     private let identity: Identity
@@ -146,11 +149,15 @@ actor HubConnection {
 
     private func agentLeft() {
         departuresSeen += 1
+        // The serial handler may be parked in an audio read; stop this connection's microphone
+        // from the reader so an agent departure silences it at once instead of after the chunk.
+        audio.stopAll(owner: owner)
         cancelPrompt()
     }
 
     private func socketDied() {
         socketEnded = true
+        audio.stopAll(owner: owner)
         cancelPrompt()
     }
 
@@ -311,7 +318,7 @@ actor HubConnection {
             case "listen":
                 let ms = (inner["durationMs"] as? NSNumber)?.intValue ?? 0
                 let rate = (inner["sampleRate"] as? NSNumber)?.intValue ?? 0
-                let out = try await audio.oneShot(durationMs: min(60000, max(100, ms > 0 ? ms : 5000)),
+                let out = try await audio.oneShot(owner: owner, durationMs: min(60000, max(100, ms > 0 ? ms : 5000)),
                                                   sampleRate: rate > 0 ? rate : 16000)
                 reply = out.meta
                 reply["type"] = "frame"
@@ -319,22 +326,22 @@ actor HubConnection {
             case "audio_start":
                 let cap = (inner["maxDurationMs"] as? NSNumber)?.intValue ?? 0
                 let rate = (inner["sampleRate"] as? NSNumber)?.intValue ?? 0
-                reply = try audio.start(maxDurationMs: min(7200000, Swift.max(0, cap)), sampleRate: rate > 0 ? rate : 16000)
+                reply = try audio.start(owner: owner, maxDurationMs: min(7200000, Swift.max(0, cap)), sampleRate: rate > 0 ? rate : 16000)
                 reply["type"] = "audio_started"
             case "audio_read":
                 let ms = (inner["durationMs"] as? NSNumber)?.intValue ?? 0
-                let out = try await audio.read(id: inner["listenId"] as? String ?? "",
+                let out = try await audio.read(owner: owner, id: inner["listenId"] as? String ?? "",
                                                maxMs: min(30000, max(100, ms > 0 ? ms : 10000)))
                 reply = out.meta
                 reply["type"] = "frame"
                 payload = out.wav
             case "audio_stop":
-                reply = try audio.stop(id: inner["listenId"] as? String ?? "")
+                reply = try audio.stop(owner: owner, id: inner["listenId"] as? String ?? "")
                 reply["type"] = "status"
             case "level":
                 let ms = (inner["durationMs"] as? NSNumber)?.intValue ?? 0
                 let rate = (inner["sampleRate"] as? NSNumber)?.intValue ?? 0
-                reply = try await audio.level(durationMs: min(30000, max(100, ms > 0 ? ms : 1000)),
+                reply = try await audio.level(owner: owner, durationMs: min(30000, max(100, ms > 0 ? ms : 1000)),
                                               sampleRate: rate > 0 ? rate : 16000)
                 reply["type"] = "levels"
             default:
@@ -356,7 +363,7 @@ actor HubConnection {
 
     private func resetAgent() {
         // Privacy: no microphone survives an agent leaving, reconnecting or being replaced.
-        audio.stopAll()
+        audio.stopAll(owner: owner)
         agentHere = false
         seal = nil
         challenge = nil

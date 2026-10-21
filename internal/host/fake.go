@@ -65,6 +65,15 @@ type phoneState struct {
 	Key    string `json:"key,omitempty"`
 }
 
+// chunkDuration normalizes an audio_read duration the way the phones do: a missing or negative
+// value is the default chunk, and the protocol cap stands.
+func chunkDuration(ms int) int {
+	if ms <= 0 {
+		ms = protocol.DefaultChunkMs
+	}
+	return min(max(ms, 100), protocol.MaxChunkMs)
+}
+
 // fakeAudio is a live recording session: samples exist from the moment it started, and reads
 // consume them in order so an agent that polls slowly still receives every second.
 type fakeAudio struct {
@@ -335,8 +344,11 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 				reply(protocol.Message{Type: protocol.TypeError, Err: "no such audio session"}, nil)
 				return
 			}
-			want := int64(m.DurationMs) * int64(listen.rate) / 1000
-			deadline := time.Now().Add(time.Duration(m.DurationMs+5000) * time.Millisecond)
+			// Normalize like the phones do: a missing or negative duration is the default chunk,
+			// and the chunk cap stands. A negative value would otherwise panic the tone generator.
+			ms := chunkDuration(m.DurationMs)
+			want := int64(ms) * int64(listen.rate) / 1000
+			deadline := time.Now().Add(time.Duration(ms+5000) * time.Millisecond)
 			for {
 				avail, ended := listen.available()
 				if avail-listen.read >= want || ended || time.Now().After(deadline) {
@@ -344,7 +356,7 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 				}
 				time.Sleep(20 * time.Millisecond)
 			}
-			pcm, totalMs, ended := listen.take(m.DurationMs)
+			pcm, totalMs, ended := listen.take(ms)
 			level := audio.Level(pcm)
 			reply(protocol.Message{Mime: protocol.AudioMime, DurationMs: len(pcm) * 1000 / (listen.rate * 2), SampleRate: listen.rate, TotalMs: totalMs, Ended: ended, Levels: &level}, audio.EncodeWAV(pcm, listen.rate))
 		case protocol.TypeAudioStop:

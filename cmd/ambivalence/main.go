@@ -345,15 +345,23 @@ func streamAudio(sess *peer.Session, out string, maxMs, rate int) error {
 		// patching would fail after a successful recording, so leave its header at zero.
 		seeker = os.Stdout
 	}
-	sw := &wavStream{w: w, seeker: seeker, rate: started.SampleRate}
+	// One effective rate for the header and the summary: the host may correct or omit the rate,
+	// and --rate 0 asks the host to choose.
+	effRate := started.SampleRate
+	if effRate == 0 {
+		effRate = rate
+	}
+	if effRate == 0 {
+		effRate = protocol.DefaultAudioSampleRate
+	}
+	sw := &wavStream{w: w, seeker: seeker, rate: effRate}
 	if err := sw.start(); err != nil {
 		stopSession()
 		return err
 	}
-	deadline := time.Time{}
-	if maxMs > 0 {
-		deadline = time.Now().Add(time.Duration(maxMs) * time.Millisecond)
-	}
+	// The phone stops recording at maxMs on its own; keep draining until it reports ended so a
+	// tail still in flight is not lost to the local clock.
+	deadline := audioDrainDeadline(maxMs, time.Now())
 	for {
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			break
@@ -386,10 +394,24 @@ func streamAudio(sess *peer.Session, out string, maxMs, rate int) error {
 		return err
 	}
 	if path != "" && path != "-" {
-		fmt.Fprintf(os.Stderr, "wrote %s %.1fs %d Hz\n", path, float64(sw.dataBytes)/(float64(rate)*2), rate)
+		fmt.Fprintf(os.Stderr, "wrote %s %.1fs %d Hz\n", path, float64(sw.dataBytes)/(float64(effRate)*2), effRate)
 		fmt.Println(path)
 	}
 	return nil
+}
+
+// audioDrainGrace is how long past the requested cap we keep waiting for the phone to report the
+// session ended. The cap is enforced on the phone, so this only bounds a host that never ends.
+const audioDrainGrace = 60 * time.Second
+
+// audioDrainDeadline returns the local backstop for a streaming recording. It sits well past the
+// phone's own cap so the buffered tail is drained, not truncated by the agent's clock. A zero cap
+// (record until interrupted) has no backstop and returns the zero time.
+func audioDrainDeadline(maxMs int, now time.Time) time.Time {
+	if maxMs <= 0 {
+		return time.Time{}
+	}
+	return now.Add(time.Duration(maxMs)*time.Millisecond + audioDrainGrace)
 }
 
 // wavStream writes a canonical header up front and patches its size fields when the output
