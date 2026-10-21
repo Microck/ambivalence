@@ -12,6 +12,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * The phone's one identity, shared by every hub connection. `device` is a public id; `key` is
@@ -107,6 +108,8 @@ class HubClient(
     @Volatile private var stopped = false
     @Volatile private var pendingConfirm: CompletableFuture<Boolean>? = null
     @Volatile private var confirmGone = false // the prompt closed because the agent or socket went away
+    private val departuresSeen = AtomicInteger(0)
+    private var departuresHandled = 0
     private val writeLock = Any()
 
     // Per-agent state, inbox thread only: reset whenever an agent arrives or leaves. seal is set
@@ -131,6 +134,7 @@ class HubClient(
 
     fun disconnect() {
         stopped = true
+        departuresSeen.incrementAndGet()
         stopAudio()
         pendingConfirm?.complete(false)
         socket?.close(1000, "bye")
@@ -148,9 +152,19 @@ class HubClient(
         runCatching { camera.audioStop(owner, null) }
     }
 
+    private fun isDeparture(m: JSONObject?): Boolean {
+        val type = m?.optString("type") ?: return false
+        return (type == "status" || type == "welcome") && !m.optBoolean("connected")
+    }
+
+    private val agentGone: Boolean
+        get() = stopped || socket == null || departuresSeen.get() > departuresHandled
+
     private fun open() {
         if (stopped) return
         reached = false
+        departuresSeen.set(0)
+        departuresHandled = 0
         val ws = http.newWebSocket(Request.Builder().url(candidates[tryIdx]).build(), object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: okhttp3.Response) {
                 post { if (webSocket === socket) { reached = true; good = tryIdx } }
@@ -165,7 +179,8 @@ class HubClient(
                 // socket thread so an agent leaving cancels the prompt and stops our microphone
                 // without queueing behind a chunk that can run for up to 30 s.
                 val m = runCatching { JSONObject(text) }.getOrNull()
-                if (webSocket === socket && m?.optString("type") == "status" && !m.optBoolean("connected")) {
+                if (webSocket === socket && isDeparture(m)) {
+                    departuresSeen.incrementAndGet()
                     if (pendingConfirm != null) dismissConfirm()
                     stopAudio()
                 }
@@ -192,6 +207,7 @@ class HubClient(
     // Callbacks can fire before open() has stored the socket; the inbox runs after it, in order.
     private fun lost(ws: WebSocket) {
         if (ws === socket) { // the inbox may be blocked on the prompt or in an audio read
+            departuresSeen.incrementAndGet()
             dismissConfirm()
             stopAudio()
         }
@@ -226,10 +242,14 @@ class HubClient(
                 hubId = m.optString("hubId").ifEmpty { null }
                 live = true
                 events.welcomed(this)
+                if (!m.optBoolean("connected") && departuresHandled < departuresSeen.get()) departuresHandled++
                 presence(m.optBoolean("connected"))
                 events.changed()
             }
-            "status" -> presence(m.optBoolean("connected"))
+            "status" -> {
+                if (!m.optBoolean("connected") && departuresHandled < departuresSeen.get()) departuresHandled++
+                presence(m.optBoolean("connected"))
+            }
             "ping" -> send(JSONObject().put("type", "pong").put("id", id))
             "auth" -> auth(m)
             "pair1" -> pair1(m)
@@ -293,6 +313,7 @@ class HubClient(
     }
 
     private fun auth(m: JSONObject) {
+        if (agentGone) return
         val nP = Link.unhex(m.optString("nonce"))
         val nA = Link.unhex(m.optString("agentNonce"))
         val mac = Link.unhex(m.optString("mac"))
@@ -307,6 +328,7 @@ class HubClient(
     }
 
     private fun pair1(m: JSONObject) {
+        if (agentGone) return
         val id = m.optString("id")
         pairCommit = Link.unhex(m.optString("commit"))
         val p = try { Party() } catch (e: Exception) { return sendError(id, e.message ?: "pairing failed") }
@@ -319,6 +341,10 @@ class HubClient(
     }
 
     private fun pair3(m: JSONObject) {
+        if (agentGone) {
+            pairing = null
+            return
+        }
         val id = m.optString("id")
         val agentPub = Link.unhex(m.optString("pub"))
         val nA = Link.unhex(m.optString("nonce"))
@@ -330,9 +356,16 @@ class HubClient(
         val shared = runCatching { p.shared(agentPub) }.getOrNull()
         if (shared == null || !confirm(Link.sas(agentPub, p.pub, nA, pairNB))) {
             // Agent gone: no reject, which could drop a newer agent whose arrival is queued behind us.
-            if (confirmGone) return
+            if (confirmGone || agentGone) {
+                pairing = null
+                return
+            }
             sendError(id, "pairing cancelled on the phone")
             return reject()
+        }
+        if (agentGone) {
+            pairing = null
+            return
         }
         val key = Link.key(shared, agentPub, p.pub)
         identity.setKey(key)
@@ -346,7 +379,7 @@ class HubClient(
         confirmGone = false
         pendingConfirm = answer
         try {
-            if (socket == null || stopped) return false
+            if (agentGone) return false
             events.confirm(sas, answer)
             return answer.get(120, TimeUnit.SECONDS)
         } catch (e: Exception) {
@@ -368,17 +401,19 @@ class HubClient(
         val id = m.optString("id")
         // No seal yet (e.g. the phone just reconnected): make the agent re-authenticate.
         val s = seal ?: return sendError(id, UNAUTHENTICATED)
+        if (agentGone) return
         val inner = try {
             JSONObject(String(s.rx.open(Base64.getDecoder().decode(m.optString("box"))), Charsets.UTF_8))
         } catch (e: Exception) {
             return // forged or replayed by the hub: ignore it, keep serving the real agent
         }
-        if (inner.optString("id") != id) return
+        if (inner.optString("id") != id || agentGone) return
         serve(s, inner)
     }
 
     // Serves one opened request; every reply goes back sealed under the session it came in on.
     private fun serve(s: Seal, m: JSONObject) {
+        if (agentGone) return
         val id = m.optString("id")
         val type = m.optString("type")
         try {
@@ -441,8 +476,10 @@ class HubClient(
     // Seals under the write lock so wire order equals sequence order; a frame's payload follows
     // as its own box. The outer id only routes; the agent checks the inner one.
     private fun sendSealed(s: Seal, inner: JSONObject, payload: ByteArray? = null) {
+        if (agentGone || s !== seal) return
         inner.put("v", 1)
         synchronized(writeLock) {
+            if (agentGone || s !== seal) return
             val ws = socket ?: return
             val box = s.tx.seal(inner.toString().toByteArray(Charsets.UTF_8))
             ws.send(

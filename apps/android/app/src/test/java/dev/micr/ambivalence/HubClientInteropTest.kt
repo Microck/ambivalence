@@ -13,7 +13,9 @@ import java.io.File
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.file.Files
+import java.util.Base64
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
@@ -23,6 +25,81 @@ import java.util.concurrent.TimeUnit
 class HubClientInteropTest {
     private val bin = System.getenv("AMBIVALENCE_BIN")
     private val jpeg = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 1, 2, 3, 4, 0xFF.toByte(), 0xD9.toByte())
+
+    @Test fun queuedListenAfterDepartureDoesNotOpenMicrophone() {
+        val identity = Identity(MemoryPrefs())
+        val key = ByteArray(32) { (it + 1).toByte() }
+        identity.setKey(key)
+        val events = object : HubClient.Events {
+            override fun changed() {}
+            override fun welcomed(client: HubClient) {}
+            override fun dropped(client: HubClient) {}
+            override fun note(text: String) {}
+            override fun confirm(sas: String, answer: CompletableFuture<Boolean>) { answer.complete(true) }
+        }
+        val enterCapture = CountDownLatch(1)
+        val releaseCapture = CountDownLatch(1)
+        val camera = object : FakeCamera() {
+            override fun capture(quality: Int, maxWidth: Int): Pair<JSONObject, ByteArray> {
+                enterCapture.countDown()
+                releaseCapture.await(5, TimeUnit.SECONDS)
+                return super.capture(quality, maxWidth)
+            }
+        }
+        val client = HubClient(listOf("ws://127.0.0.1:1/v1"), identity, camera, events)
+        val nP = ByteArray(16) { 0x11 }
+        val nA = ByteArray(16) { 0x22 }
+        // Install an authenticated seal and a dummy active socket via reflection to exercise
+        // WebSocketListener.onMessage queueing directly without needing a live network server.
+        val agentSeal = Seal(key, identity.device, nP, nA)
+        val phoneSeal = Seal(key, identity.device, nP, nA)
+        val dummySocket = java.lang.reflect.Proxy.newProxyInstance(
+            okhttp3.WebSocket::class.java.classLoader,
+            arrayOf(okhttp3.WebSocket::class.java),
+        ) { _, method, _ ->
+            when (method.name) {
+                "send", "close" -> true
+                else -> null
+            }
+        } as okhttp3.WebSocket
+        HubClient::class.java.getDeclaredField("socket").apply { isAccessible = true; set(client, dummySocket) }
+        HubClient::class.java.getDeclaredField("seal").apply { isAccessible = true; set(client, phoneSeal) }
+        HubClient::class.java.getDeclaredField("agentHere").apply { isAccessible = true; set(client, true) }
+
+        fun sealedMsg(id: String, inner: JSONObject): String {
+            val box = agentSeal.rx.seal(inner.put("id", id).toString().toByteArray(Charsets.UTF_8))
+            return JSONObject().put("type", "sealed").put("id", id)
+                .put("box", Base64.getEncoder().encodeToString(box)).toString()
+        }
+
+        val handleMethod = HubClient::class.java.getDeclaredMethod("handle", String::class.java).apply { isAccessible = true }
+        val postMethod = HubClient::class.java.getDeclaredMethod("post", Function0::class.java).apply { isAccessible = true }
+        val departuresSeenField = HubClient::class.java.getDeclaredField("departuresSeen").apply { isAccessible = true }
+        val departuresSeen = departuresSeenField.get(client) as java.util.concurrent.atomic.AtomicInteger
+
+        // 1. Enqueue a capture that blocks the inbox thread.
+        val capMsg = sealedMsg("cap-1", JSONObject().put("type", "capture"))
+        postMethod.invoke(client, { handleMethod.invoke(client, capMsg) })
+        assertTrue(enterCapture.await(5, TimeUnit.SECONDS))
+
+        // 2. Enqueue a sealed listen request behind the blocked capture.
+        val listenMsg = sealedMsg("listen-1", JSONObject().put("type", "listen").put("durationMs", 60000))
+        postMethod.invoke(client, { handleMethod.invoke(client, listenMsg) })
+
+        // 3. Agent departs while capture is still running on the inbox thread.
+        departuresSeen.incrementAndGet()
+        val depMsg = JSONObject().put("type", "status").put("connected", false).toString()
+        postMethod.invoke(client, { handleMethod.invoke(client, depMsg) })
+
+        // 4. Release the capture and wait for the inbox queue to drain.
+        releaseCapture.countDown()
+        val done = CountDownLatch(1)
+        postMethod.invoke(client, { done.countDown() })
+        assertTrue(done.await(5, TimeUnit.SECONDS))
+
+        assertEquals("queued listen must not run after departure", 0, camera.listenCalls)
+        client.disconnect()
+    }
 
     @Test fun pairAuthCapture() {
         assumeTrue("set AMBIVALENCE_BIN to run", bin != null)
@@ -92,7 +169,8 @@ class HubClientInteropTest {
         return text to proc.exitValue()
     }
 
-    private inner class FakeCamera : CameraHost {
+    private open inner class FakeCamera : CameraHost {
+        @Volatile var listenCalls = 0
         @Volatile var audioStopCalls = 0
         @Volatile var lastStopOwner: String? = null
         override fun cameras(): JSONObject = JSONObject().put("capabilities", JSONObject().put("controlsVersion", 1)).put("facing", "back").put("torch", false).put("zoom", 1.0)
@@ -103,8 +181,10 @@ class HubClientInteropTest {
         override fun capture(quality: Int, maxWidth: Int): Pair<JSONObject, ByteArray> =
             JSONObject().put("facing", "back").put("cameraId", "back").put("torch", false).put("zoom", 1.0).put("width", 4).put("height", 2) to jpeg
 
-        override fun listen(owner: String, durationMs: Int, sampleRate: Int): Pair<JSONObject, ByteArray> =
-            JSONObject().put("mime", "audio/wav").put("durationMs", durationMs).put("sampleRate", sampleRate).put("levels", JSONObject().put("rmsDb", -100).put("peakDb", -100)) to ByteArray(44)
+        override fun listen(owner: String, durationMs: Int, sampleRate: Int): Pair<JSONObject, ByteArray> {
+            listenCalls++
+            return JSONObject().put("mime", "audio/wav").put("durationMs", durationMs).put("sampleRate", sampleRate).put("levels", JSONObject().put("rmsDb", -100).put("peakDb", -100)) to ByteArray(44)
+        }
 
         override fun audioStart(owner: String, maxDurationMs: Int, sampleRate: Int): JSONObject =
             JSONObject().put("listenId", "fake").put("sampleRate", sampleRate).put("maxDurationMs", maxDurationMs)

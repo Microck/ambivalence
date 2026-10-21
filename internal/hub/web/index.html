@@ -144,8 +144,9 @@
   // Per-agent state, reset when an agent arrives or leaves. seal is set once the agent proved
   // the link; only requests sealed under it may touch the camera. departuresSeen/Handled count
   // agent departures on the socket vs in the serial inbox so queued requests never open the mic
-  // after the agent has already left.
-  let agentHere = false, seal = null, challenge = null, pairing = null, squatTimer = null, departuresSeen = 0, departuresHandled = 0;
+  // after the agent has already left; agentGen bumps on every reset or socket close so an
+  // in-flight auth/pair3 cannot install a seal after the agent or socket went away.
+  let agentHere = false, seal = null, challenge = null, pairing = null, squatTimer = null, departuresSeen = 0, departuresHandled = 0, agentGen = 0;
   // Sealed sends run one at a time so wire order equals sequence order.
   let outbox = Promise.resolve();
 
@@ -498,40 +499,46 @@
         case "ping": return send({ type: "pong", id: m.id });
         case "auth": {
           if (agentGone()) return;
+          const gen = agentGen;
           const key = fromHex(ident.key), nP = fromHex(m.nonce), nA = fromHex(m.agentNonce), dev = enc.encode(ident.device);
-          if (!ident.key || !challenge || nA.length !== 16 || !same(nP, challenge) || !same(fromHex(m.mac), await MAC(key, "agent", dev, nP, nA))) return agentGone() ? undefined : reject();
+          if (!ident.key || !challenge || nA.length !== 16 || !same(nP, challenge) || !same(fromHex(m.mac), await MAC(key, "agent", dev, nP, nA))) return (gen !== agentGen || agentGone()) ? undefined : reject();
           const nextSeal = await makeSeal(key, nP, nA);
-          if (agentGone()) return;
+          const mac = toHex(await MAC(key, "phone", dev, nP, nA));
+          if (gen !== agentGen || agentGone()) return;
           seal = nextSeal; challenge = null; clearTimeout(squatTimer);
           setStatus("paired, agent can see this camera and hear this microphone");
-          return send({ type: "authok", nonce: m.nonce, mac: toHex(await MAC(key, "phone", dev, nP, nA)) });
+          return send({ type: "authok", nonce: m.nonce, mac });
         }
         case "pair1": {
           if (agentGone()) return;
+          const gen = agentGen;
           const kp = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
           const pub = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
-          if (agentGone()) return;
+          if (gen !== agentGen || agentGone()) return;
           pairing = { kp, pub, nB: rand(16), commit: fromHex(m.commit) };
           return send({ type: "pair2", id: m.id, pub: toHex(pub), nonce: toHex(pairing.nB), device: ident.device });
         }
         case "pair3": {
           if (agentGone()) { pairing = null; return; }
+          const gen = agentGen;
           const p = pairing, aPub = fromHex(m.pub), nA = fromHex(m.nonce);
-          if (!p || nA.length !== 16 || !same(p.commit, await H("commit", aPub, nA))) { if (!agentGone()) { send({ type: "error", id: m.id, error: "pairing commitment mismatch" }); return reject(); } pairing = null; return; }
+          if (!p || nA.length !== 16 || !same(p.commit, await H("commit", aPub, nA))) { if (gen === agentGen && !agentGone()) { send({ type: "error", id: m.id, error: "pairing commitment mismatch" }); return reject(); } pairing = null; return; }
           const peer = await crypto.subtle.importKey("raw", aPub, { name: "ECDH", namedCurve: "P-256" }, false, []);
           const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: peer }, p.kp.privateKey, 256));
+          if (gen !== agentGen || agentGone()) { pairing = null; return; }
           const answer = await askConfirm(await SAS(aPub, p.pub, nA, p.nB));
           // The agent already left: no error or reject, which could drop a newer agent whose
           // arrival is still queued behind this handler.
-          if (answer === "gone" || agentGone()) { pairing = null; return; }
+          if (answer === "gone" || gen !== agentGen || agentGone()) { pairing = null; return; }
           if (!answer) { send({ type: "error", id: m.id, error: "pairing cancelled on the phone" }); return reject(); }
           const key = await H("key", shared, aPub, p.pub);
           const nextSeal = await makeSeal(key, p.nB, nA);
-          if (agentGone()) { pairing = null; return; }
+          const mac = toHex(await MAC(key, "confirm", enc.encode(ident.device)));
+          if (gen !== agentGen || agentGone()) { pairing = null; return; }
           ident.key = toHex(key); saveIdent(); showCode(code);
           seal = nextSeal; pairing = null; clearTimeout(squatTimer);
           setStatus("paired, agent can see this camera and hear this microphone");
-          return send({ type: "pair4", id: m.id, mac: toHex(await MAC(key, "confirm", enc.encode(ident.device))) });
+          return send({ type: "pair4", id: m.id, mac });
         }
         case "sealed": {
           if (!seal) return send({ type: "error", id: m.id, error: "agent not authenticated" });
@@ -656,6 +663,7 @@
     if (present && agentHere) return;
     void haltListening();
     if (seal) seal.gone = true;
+    agentGen++;
     agentHere = present; seal = null; challenge = null; pairing = null; clearTimeout(squatTimer);
     setStatus(present ? "agent connecting" : "connected, waiting for the agent");
     if (!present) return;
@@ -666,6 +674,7 @@
     send({ type: "reject" });
     void haltListening();
     if (seal) seal.gone = true;
+    agentGen++;
     agentHere = false; seal = null; challenge = null; pairing = null; clearTimeout(squatTimer);
     setStatus("refused an agent that could not prove the link");
   }
@@ -685,6 +694,7 @@
     setStatus("connecting to " + parsed.host);
     ws = new WebSocket(url);
     if (seal) seal.gone = true;
+    agentGen++;
     cancelConfirm(); void haltListening(); agentHere = false; seal = null; challenge = null; pairing = null;
     departuresSeen = 0; departuresHandled = 0;
     clearTimeout(squatTimer);
@@ -702,14 +712,15 @@
         cancelConfirm();
         void haltListening();
       }
-      inbox = inbox.then(() => { if (ws === mine) return onMessage(ev); });
+      inbox = inbox.then(() => { if (ws === mine && ws.readyState !== 2 && ws.readyState !== 3) return onMessage(ev); });
     };
     // Stay linked through network drops: redial this socket's URL until a newer connect() replaces it.
     ws.onclose = () => {
       if (ws !== mine) return;
       if (seal) seal.gone = true;
+      agentGen++;
+      departuresSeen++;
       cancelConfirm(); void haltListening(); agentHere = false; seal = null; challenge = null; pairing = null;
-      departuresSeen = 0; departuresHandled = 0;
       clearTimeout(squatTimer);
       setStatus("disconnected, reconnecting");
       setTimeout(() => { if (ws === mine) connect(); }, 3000);

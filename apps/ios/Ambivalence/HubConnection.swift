@@ -161,7 +161,7 @@ actor HubConnection {
         cancelPrompt()
     }
 
-    /// The agent being handled can no longer complete a pairing.
+    /// The agent being handled can no longer complete a pairing or run queued requests.
     private var agentGone: Bool { closed || socketEnded || departuresSeen > departuresHandled }
 
     private func cancelPrompt() {
@@ -190,6 +190,7 @@ actor HubConnection {
         case "auth":
             auth(m)
         case "pair1":
+            guard !agentGone else { return }
             let p = Pairing(commit: Link.unhex(m["commit"] as? String))
             pairing = p
             send(["type": "pair2", "id": id, "pub": Link.hex(p.party.pub), "nonce": Link.hex(p.nB), "device": identity.device])
@@ -235,6 +236,7 @@ actor HubConnection {
     }
 
     private func auth(_ m: [String: Any]) {
+        guard !agentGone else { return }
         let nP = Link.unhex(m["nonce"] as? String), nA = Link.unhex(m["agentNonce"] as? String)
         let mac = Link.unhex(m["mac"] as? String), dev = Data(identity.device.utf8)
         guard let key = identity.key, let challenge, nA.count == 16, Link.equal(nP, challenge),
@@ -247,6 +249,10 @@ actor HubConnection {
     }
 
     private func pair3(_ id: String, _ m: [String: Any]) async {
+        guard !agentGone else {
+            pairing = nil
+            return
+        }
         let agentPub = Link.unhex(m["pub"] as? String), nA = Link.unhex(m["nonce"] as? String)
         guard let p = pairing, nA.count == 16, Link.equal(p.commit, Link.H("commit", agentPub, nA)) else {
             sendError(id, "pairing commitment mismatch")
@@ -290,6 +296,8 @@ actor HubConnection {
             // The phone just (re)connected: make the agent re-authenticate.
             return sendError(id, HubConnection.unauthenticated)
         }
+        guard !agentGone else { return }
+        let gen = agentGen
         // Anything that fails to open, or whose inner id differs, was forged or replayed by the
         // hub: ignore it and keep serving the real agent.
         guard let box = Data(base64Encoded: m["box"] as? String ?? ""), let plain = try? s.rx.open(box),
@@ -311,7 +319,7 @@ actor HubConnection {
                 let cam = (inner["camera"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                 reply = try await camera.command(camera: cam, torchOn: inner["torchOn"] as? Bool,
                                                  zoom: (inner["zoomLevel"] as? NSNumber)?.doubleValue,
- controls: inner["controls"] as? [String: Any])
+                                                 controls: inner["controls"] as? [String: Any])
             case "capture":
                 let q = (inner["quality"] as? NSNumber)?.intValue ?? 0, w = (inner["maxWidth"] as? NSNumber)?.intValue ?? 0
                 (reply, payload) = try await camera.capture(quality: q > 0 ? q : 80, maxWidth: w > 0 ? w : 1280)
@@ -347,9 +355,11 @@ actor HubConnection {
             default:
                 throw LinkError("unknown request \(inner["type"] as? String ?? "")")
             }
+            guard gen == agentGen, !agentGone else { return }
             reply["id"] = id
             sendSealed(s, reply, payload: payload)
         } catch {
+            guard gen == agentGen, !agentGone else { return }
             sendSealed(s, ["type": "error", "id": id, "error": error.localizedDescription])
         }
     }
@@ -391,7 +401,7 @@ actor HubConnection {
     /// Seals a reply and, for a frame, its payload as the next box. Nothing suspends between
     /// sealing and enqueueing, and the socket sends in enqueue order, so sequence order is wire order.
     private func sendSealed(_ s: Seal, _ obj: [String: Any], payload: Data? = nil) {
-        guard !closed else { return }
+        guard !closed, !agentGone else { return }
         guard let inner = HubConnection.encode(obj),
               let outer = HubConnection.encode(["type": "sealed", "id": obj["id"] as? String ?? "",
                                                 "box": s.tx.seal(Data(inner.utf8)).base64EncodedString()]) else { return }

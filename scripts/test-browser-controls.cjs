@@ -163,7 +163,7 @@ test('invalid hub URLs are reported without throwing or closing the current sock
     const context = vm.createContext({ URL, hubEl: { value, blur() {} },
       ws: { close() { closed = true; } }, setStatus(s) { status = s; }, haltListening() {},
       WebSocket: class { constructor() { throw new Error('must not open a socket'); } } });
-    vm.runInContext(connectSource, context);
+    vm.runInContext('let agentGen = 0, departuresSeen = 0, departuresHandled = 0, agentHere = false, seal = null, challenge = null, pairing = null, squatTimer = null;\n' + connectSource, context);
     assert.doesNotThrow(() => context.connect(), value);
     assert.match(status, /invalid hub URL/);
     assert.equal(closed, false);
@@ -200,7 +200,7 @@ test('late close from a replaced socket does not reset the current link', () => 
   const context = vm.createContext({ URL, WebSocket: Socket, ws: null,
     hubEl: { value: 'ws://127.0.0.1:17842/v1', blur() {} }, setStatus() {},
     cancelConfirm() { cancelled++; }, agentHere: true, seal: { active: true },
-    clearTimeout() {}, squatTimer: null, challenge: null, pairing: null,
+    clearTimeout() {}, squatTimer: null, challenge: null, pairing: null, agentGen: 0, departuresSeen: 0, departuresHandled: 0,
     setTimeout() {}, send() {}, onMessage() {}, haltListening() {}, ident: { device: 'fixture' } });
   vm.runInContext(html.slice(html.indexOf('  function connect()'), html.indexOf('  $("connect").onclick')), context);
   context.connect(); context.connect();
@@ -214,7 +214,7 @@ test('replacement socket clears the previous peer authentication state', () => {
   const context = vm.createContext({ URL, WebSocket: class { close() {} },
     ws: {close() {}}, hubEl: {value:'ws://127.0.0.1:17842/v1',blur() {}},
     setStatus() {}, cancelConfirm() {}, clearTimeout() {}, setTimeout() {},
-    agentHere:true, seal:{old:true}, challenge:{old:true}, pairing:{old:true}, squatTimer:123,
+    agentHere:true, seal:{old:true}, challenge:{old:true}, pairing:{old:true}, squatTimer:123, agentGen: 0, departuresSeen: 0, departuresHandled: 0,
     ident:{device:'fixture'}, send() {}, onMessage() {}, haltListening() {} });
   vm.runInContext(html.slice(html.indexOf('  function connect()'),html.indexOf('  $("connect").onclick')),context);
   context.connect();
@@ -233,7 +233,7 @@ test('agent departure halts listening immediately while inbox is blocked on an a
   const context = vm.createContext({ URL, WebSocket: Socket, ws: null,
     hubEl: { value: 'ws://127.0.0.1:17842/v1', blur() {} }, setStatus() {},
     cancelConfirm() {}, clearTimeout() {}, setTimeout() {},
-    agentHere: true, seal: { active: true }, challenge: null, pairing: null, squatTimer: null,
+    agentHere: true, seal: { active: true }, challenge: null, pairing: null, squatTimer: null, agentGen: 0, departuresSeen: 0, departuresHandled: 0,
     ident: { device: 'fixture' }, send() {},
     onMessage() { return blocked; },
     haltListening() { halted++; } });
@@ -328,7 +328,7 @@ test('sealed listen request awaiting openBox when agent departs never opens the 
     window: { isSecureContext: true },
   });
   vm.runInContext(
-    'let listen = null, listenGen = 0, agentHere = false, seal = null, challenge = null, pairing = null, squatTimer = null, departuresSeen = 0, departuresHandled = 0, outbox = Promise.resolve();\n' +
+    'let listen = null, listenGen = 0, agentHere = false, seal = null, challenge = null, pairing = null, squatTimer = null, departuresSeen = 0, departuresHandled = 0, agentGen = 0, outbox = Promise.resolve();\n' +
     html.slice(html.indexOf('  const showRec ='), html.indexOf('  $("connect").onclick')),
     context,
   );
@@ -345,4 +345,55 @@ test('sealed listen request awaiting openBox when agent departs never opens the 
   await new Promise(r => setImmediate(r));
   assert.equal(opened, 0);
   assert.equal(rec.hidden, true);
+});
+
+test('in-flight auth finishing after ws.onclose does not restore a seal or let queued requests open the microphone', async () => {
+  let socket, resolveSeal, opened = 0;
+  const rec = { hidden: true };
+  class Socket {
+    constructor() { socket = this; this.readyState = 1; }
+    send() {}
+    close() { this.readyState = 3; }
+  }
+  const context = vm.createContext({
+    URL, TextDecoder, Uint8Array,
+    $: () => rec,
+    toHex: (u) => Buffer.from(u).toString('hex'),
+    fromHex: (s) => new Uint8Array(Buffer.from(s || '', 'hex')),
+     same: () => true,
+    MAC: async () => new Uint8Array(32),
+    rand: () => new Uint8Array(16),
+    unb64: () => new Uint8Array(24),
+    b64: () => '',
+    makeSeal: () => new Promise(r => { resolveSeal = r; }),
+    openBox: async () => new TextEncoder().encode('{"type":"audio_start","id":"req-1"}'),
+    sealBox: async () => new Uint8Array(24),
+    enc: new TextEncoder(),
+    WebSocket: Socket,
+    ws: null, stream: null, facing: 'environment', torchOn: false, zoomLevel: 1, code: '123456',
+    hubEl: { value: 'ws://127.0.0.1:17842/v1', blur() {} },
+    ident: { device: 'fixture', key: '00'.repeat(32) },
+    setStatus() {}, showCode() {}, cancelConfirm() {}, clearTimeout() {}, setTimeout() {},
+    controlCapabilities: () => ({}), controlSettings: () => ({}),
+    navigator: { mediaDevices: { getUserMedia: async () => { opened++; throw new Error('must not call getUserMedia'); } } },
+    window: { isSecureContext: true },
+  });
+  vm.runInContext(
+    'let listen = null, listenGen = 0, agentHere = false, seal = null, challenge = null, pairing = null, squatTimer = null, departuresSeen = 0, departuresHandled = 0, agentGen = 0, outbox = Promise.resolve();\n' +
+    html.slice(html.indexOf('  const showRec ='), html.indexOf('  $("connect").onclick')),
+    context,
+  );
+  context.connect();
+  vm.runInContext('agentHere = true; challenge = new Uint8Array(16);', context);
+  socket.onmessage({ data: JSON.stringify({ type: 'auth', nonce: '00'.repeat(16), agentNonce: '11'.repeat(16), mac: '22'.repeat(32) }) });
+  socket.onmessage({ data: JSON.stringify({ type: 'sealed', id: 'req-1', box: 'AAAA' }) });
+  await new Promise(r => setImmediate(r));
+  // Socket closes while makeSeal() is still pending.
+  socket.readyState = 3;
+  socket.onclose();
+  resolveSeal({ rx: {}, tx: {} });
+  await new Promise(r => setImmediate(r));
+  await new Promise(r => setImmediate(r));
+  assert.equal(vm.runInContext('seal', context), null);
+  assert.equal(opened, 0);
 });
