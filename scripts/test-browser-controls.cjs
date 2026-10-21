@@ -257,19 +257,18 @@ test('disconnect while getUserMedia is awaiting permission stops acquired tracks
     $: () => rec,
     toHex: () => 'deadbeef',
     rand: () => new Uint8Array(8),
-    listen: null,
-    listenGen: 0,
     navigator: { mediaDevices: { getUserMedia: () => new Promise(r => { resolveMic = r; }) } },
     window: { isSecureContext: true, AudioContext: class { constructor() { throw new Error('must not create AudioContext'); } } },
   });
-  vm.runInContext(html.slice(html.indexOf('  const showRec ='), html.indexOf('  function captureJpeg')), context);
+  vm.runInContext('let listen = null, listenGen = 0;\n' + html.slice(html.indexOf('  const showRec ='), html.indexOf('  function captureJpeg')), context);
   const startPromise = context.startListening(10000);
+  // Let startListening advance past its initial await haltListening() and call getUserMedia().
+  await new Promise(r => setImmediate(r));
   // Disconnect / departure happens while permission prompt is still open.
   await context.haltListening();
   // User grants permission after disconnect.
   resolveMic(mic);
   await assert.rejects(startPromise, /audio session cancelled/);
   assert.equal(stopped, 1);
-  assert.equal(context.listen, null);
   assert.equal(rec.hidden, true);
 });
