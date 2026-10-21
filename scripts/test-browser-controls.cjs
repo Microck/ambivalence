@@ -288,7 +288,6 @@ test('departure during previous AudioContext.close teardown cancels replacement 
     window: { isSecureContext: true },
   });
   vm.runInContext('let listen = null, listenGen = 0;\n' + html.slice(html.indexOf('  const showRec ='), html.indexOf('  function captureJpeg')), context);
-  context.setOld = (s) => { listen = s; };
   vm.runInContext('function installOld(s) { listen = s; }', context);
   context.installOld(oldSession);
   const startPromise = context.startListening(10000);
@@ -297,6 +296,53 @@ test('departure during previous AudioContext.close teardown cancels replacement 
   resolveClose();
   await haltPromise;
   await assert.rejects(startPromise, /audio session cancelled/);
+  assert.equal(opened, 0);
+  assert.equal(rec.hidden, true);
+});
+
+test('sealed listen request awaiting openBox when agent departs never opens the microphone', async () => {
+  let socket, resolveOpen, opened = 0;
+  const rec = { hidden: true };
+  class Socket {
+    constructor() { socket = this; }
+    send() {}
+    close() {}
+  }
+  const context = vm.createContext({
+    URL, TextDecoder, Uint8Array,
+    $: () => rec,
+    toHex: () => 'deadbeef',
+    rand: () => new Uint8Array(8),
+    unb64: () => new Uint8Array(24),
+    b64: () => '',
+    openBox: () => new Promise(r => { resolveOpen = r; }),
+    sealBox: async () => new Uint8Array(24),
+    enc: new TextEncoder(),
+    WebSocket: Socket,
+    ws: null, stream: null, facing: 'environment', torchOn: false, zoomLevel: 1, code: '123456',
+    hubEl: { value: 'ws://127.0.0.1:17842/v1', blur() {} },
+    ident: { device: 'fixture', key: '' },
+    setStatus() {}, showCode() {}, cancelConfirm() {}, clearTimeout() {}, setTimeout() {},
+    controlCapabilities: () => ({}), controlSettings: () => ({}),
+    navigator: { mediaDevices: { getUserMedia: async () => { opened++; throw new Error('must not call getUserMedia'); } } },
+    window: { isSecureContext: true },
+  });
+  vm.runInContext(
+    'let listen = null, listenGen = 0, agentHere = false, seal = null, challenge = null, pairing = null, squatTimer = null, departuresSeen = 0, departuresHandled = 0, outbox = Promise.resolve();\n' +
+    html.slice(html.indexOf('  const showRec ='), html.indexOf('  $("connect").onclick')),
+    context,
+  );
+  context.connect();
+  vm.runInContext('agentHere = true; seal = { rx: {}, tx: {} };', context);
+  // Sealed listen request arrives and awaits openBox().
+  socket.onmessage({ data: '{"type":"sealed","id":"req-1","box":"AAAA"}' });
+  await new Promise(r => setImmediate(r));
+  // Agent departs while openBox() is still in flight.
+  socket.onmessage({ data: '{"type":"status","connected":false}' });
+  // Decryption finishes after departure.
+  resolveOpen(new TextEncoder().encode('{"type":"listen","id":"req-1","durationMs":60000}'));
+  await new Promise(r => setImmediate(r));
+  await new Promise(r => setImmediate(r));
   assert.equal(opened, 0);
   assert.equal(rec.hidden, true);
 });

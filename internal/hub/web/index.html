@@ -142,8 +142,10 @@
   // while teardown or the microphone permission prompt is awaiting completion.
   let listen = null, listenGen = 0;
   // Per-agent state, reset when an agent arrives or leaves. seal is set once the agent proved
-  // the link; only requests sealed under it may touch the camera.
-  let agentHere = false, seal = null, challenge = null, pairing = null, squatTimer = null;
+  // the link; only requests sealed under it may touch the camera. departuresSeen/Handled count
+  // agent departures on the socket vs in the serial inbox so queued requests never open the mic
+  // after the agent has already left.
+  let agentHere = false, seal = null, challenge = null, pairing = null, squatTimer = null, departuresSeen = 0, departuresHandled = 0;
   // Sealed sends run one at a time so wire order equals sequence order.
   let outbox = Promise.resolve();
 
@@ -314,24 +316,27 @@
     if (!navigator.mediaDevices || !window.isSecureContext) throw new Error(audioError);
     // Capture the generation after synchronous teardown of any previous session: if a disconnect
     // or departure calls haltListening() while the previous AudioContext.close() or the new
-    // getUserMedia() is awaiting completion, gen !== listenGen aborts before opening the mic.
+    // getUserMedia() is awaiting completion, or if a departure is already queued in inbox ahead
+    // of us, abort before opening the mic.
     const prev = listen;
     listen = null;
     const gen = ++listenGen;
+    const gone = () => gen !== listenGen || (typeof departuresSeen === "number" && departuresSeen > departuresHandled);
+    if (gone()) throw new Error("audio session cancelled");
     if (prev) {
       showRec(false);
       await haltMic(prev);
-      if (gen !== listenGen) throw new Error("audio session cancelled");
+      if (gone()) throw new Error("audio session cancelled");
     }
     const mic = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
-    if (gen !== listenGen) {
+    if (gone()) {
       mic.getTracks().forEach(t => t.stop());
       throw new Error("audio session cancelled");
     }
     const Ctx = window.AudioContext || window.webkitAudioContext;
     const ctx = new Ctx();
     try { await ctx.resume(); } catch {}
-    if (gen !== listenGen) {
+    if (gone()) {
       mic.getTracks().forEach(t => t.stop());
       try { await ctx.close(); } catch {}
       throw new Error("audio session cancelled");
@@ -467,11 +472,15 @@
   const send = (o) => { o.v = 1; ws.send(JSON.stringify(o)); };
   const side = () => !stream ? "unknown" : facing === "user" ? "front" : facing === "environment" ? "back" : "unknown";
   const state = (id, type) => ({ type, id, facing: side(), cameraId: stream?.getVideoTracks()[0].getSettings().deviceId || "", capabilities: controlCapabilities(stream?.getVideoTracks()[0]), settings: controlSettings(), torch: torchOn, zoom: zoomLevel, connected: true });
+  const agentGone = () => typeof departuresSeen === "number" && departuresSeen > departuresHandled;
+  const activeSeal = (s) => s && s === seal && !s.gone && !agentGone();
 
   // Replies to a sealed request go back sealed; a frame's JPEG follows as its own sealed box.
   function sendSealed(s, obj, buf) {
+    if (!activeSeal(s)) return;
     obj.v = 1;
     outbox = outbox.then(async () => {
+      if (!activeSeal(s)) return;
       ws.send(JSON.stringify({ v: 1, type: "sealed", id: obj.id, box: b64(await sealBox(s.tx, enc.encode(JSON.stringify(obj)))) }));
       if (buf) ws.send(await sealBox(s.tx, new Uint8Array(buf)));
     }).catch(() => {});
@@ -483,44 +492,55 @@
     try {
       switch (m.type) {
         case "welcome": showCode(m.code || code); // fall through
-        case "status": return onPresence(!!m.connected);
+        case "status":
+          if (!m.connected && typeof departuresSeen === "number" && departuresHandled < departuresSeen) departuresHandled++;
+          return onPresence(!!m.connected);
         case "ping": return send({ type: "pong", id: m.id });
         case "auth": {
+          if (agentGone()) return;
           const key = fromHex(ident.key), nP = fromHex(m.nonce), nA = fromHex(m.agentNonce), dev = enc.encode(ident.device);
-          if (!ident.key || !challenge || nA.length !== 16 || !same(nP, challenge) || !same(fromHex(m.mac), await MAC(key, "agent", dev, nP, nA))) return reject();
-          seal = await makeSeal(key, nP, nA); challenge = null; clearTimeout(squatTimer);
+          if (!ident.key || !challenge || nA.length !== 16 || !same(nP, challenge) || !same(fromHex(m.mac), await MAC(key, "agent", dev, nP, nA))) return agentGone() ? undefined : reject();
+          const nextSeal = await makeSeal(key, nP, nA);
+          if (agentGone()) return;
+          seal = nextSeal; challenge = null; clearTimeout(squatTimer);
           setStatus("paired, agent can see this camera and hear this microphone");
           return send({ type: "authok", nonce: m.nonce, mac: toHex(await MAC(key, "phone", dev, nP, nA)) });
         }
         case "pair1": {
+          if (agentGone()) return;
           const kp = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
           const pub = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+          if (agentGone()) return;
           pairing = { kp, pub, nB: rand(16), commit: fromHex(m.commit) };
           return send({ type: "pair2", id: m.id, pub: toHex(pub), nonce: toHex(pairing.nB), device: ident.device });
         }
         case "pair3": {
+          if (agentGone()) { pairing = null; return; }
           const p = pairing, aPub = fromHex(m.pub), nA = fromHex(m.nonce);
-          if (!p || nA.length !== 16 || !same(p.commit, await H("commit", aPub, nA))) { send({ type: "error", id: m.id, error: "pairing commitment mismatch" }); return reject(); }
+          if (!p || nA.length !== 16 || !same(p.commit, await H("commit", aPub, nA))) { if (!agentGone()) { send({ type: "error", id: m.id, error: "pairing commitment mismatch" }); return reject(); } pairing = null; return; }
           const peer = await crypto.subtle.importKey("raw", aPub, { name: "ECDH", namedCurve: "P-256" }, false, []);
           const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: peer }, p.kp.privateKey, 256));
           const answer = await askConfirm(await SAS(aPub, p.pub, nA, p.nB));
           // The agent already left: no error or reject, which could drop a newer agent whose
           // arrival is still queued behind this handler.
-          if (answer === "gone") { pairing = null; return; }
+          if (answer === "gone" || agentGone()) { pairing = null; return; }
           if (!answer) { send({ type: "error", id: m.id, error: "pairing cancelled on the phone" }); return reject(); }
           const key = await H("key", shared, aPub, p.pub);
+          const nextSeal = await makeSeal(key, p.nB, nA);
+          if (agentGone()) { pairing = null; return; }
           ident.key = toHex(key); saveIdent(); showCode(code);
-          seal = await makeSeal(key, p.nB, nA); pairing = null; clearTimeout(squatTimer);
+          seal = nextSeal; pairing = null; clearTimeout(squatTimer);
           setStatus("paired, agent can see this camera and hear this microphone");
           return send({ type: "pair4", id: m.id, mac: toHex(await MAC(key, "confirm", enc.encode(ident.device))) });
         }
         case "sealed": {
           if (!seal) return send({ type: "error", id: m.id, error: "agent not authenticated" });
+          if (!activeSeal(seal)) return;
           const s = seal;
           let inner;
           try { inner = JSON.parse(new TextDecoder().decode(await openBox(s.rx, unb64(m.box)))); } catch { return; } // forged or replayed by the hub
-          if (inner.id !== m.id) return;
-          try { await camera(s, inner); } catch (e) { sendSealed(s, { type: "error", id: inner.id, error: e.message || String(e) }); }
+          if (inner.id !== m.id || !activeSeal(s)) return;
+          try { await camera(s, inner); } catch (e) { if (activeSeal(s)) sendSealed(s, { type: "error", id: inner.id, error: e.message || String(e) }); }
           return;
         }
         // Unsealed camera requests never count, even after auth: a hub could inject them.
@@ -539,6 +559,7 @@
     return next;
   }
   async function serveCamera(s, m) {
+    if (!activeSeal(s)) return;
     switch (m.type) {
       case "cameras": {
         const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput");
@@ -574,6 +595,7 @@
         return sendSealed(s, { ...state(m.id, "frame"), mime: "image/jpeg", bytes: buf.byteLength, width: w, height: h }, buf);
       }
       case "listen": {
+        if (!activeSeal(s)) return;
         const ms = Math.max(100, Math.min(60000, m.durationMs || 5000));
         const live = await startListening(ms);
         try {
@@ -587,6 +609,7 @@
         }
       }
       case "audio_start": {
+        if (!activeSeal(s)) return;
         const ms = m.maxDurationMs || 0;
         if (ms < 0 || ms > 7200000) throw new Error("invalid max duration");
         const live = await startListening(ms);
@@ -609,6 +632,7 @@
         return sendSealed(s, { ...state(m.id, "status"), durationMs: totalMs, totalMs, ended: true });
       }
       case "level": {
+        if (!activeSeal(s)) return;
         const ms = Math.max(100, Math.min(30000, m.durationMs || 1000));
         const live = await startListening(ms);
         try {
@@ -631,6 +655,7 @@
   function onPresence(present) {
     if (present && agentHere) return;
     void haltListening();
+    if (seal) seal.gone = true;
     agentHere = present; seal = null; challenge = null; pairing = null; clearTimeout(squatTimer);
     setStatus(present ? "agent connecting" : "connected, waiting for the agent");
     if (!present) return;
@@ -640,6 +665,7 @@
   function reject() {
     send({ type: "reject" });
     void haltListening();
+    if (seal) seal.gone = true;
     agentHere = false; seal = null; challenge = null; pairing = null; clearTimeout(squatTimer);
     setStatus("refused an agent that could not prove the link");
   }
@@ -658,7 +684,9 @@
     if (ws) try { ws.close(); } catch {}
     setStatus("connecting to " + parsed.host);
     ws = new WebSocket(url);
+    if (seal) seal.gone = true;
     cancelConfirm(); void haltListening(); agentHere = false; seal = null; challenge = null; pairing = null;
+    departuresSeen = 0; departuresHandled = 0;
     clearTimeout(squatTimer);
     const mine = ws;
     ws.binaryType = "arraybuffer";
@@ -668,7 +696,9 @@
     let inbox = Promise.resolve();
     ws.onmessage = (ev) => {
       if (ws !== mine) return;
-      if (typeof ev.data === "string" && /"type":"(status|welcome)"/.test(ev.data) && !JSON.parse(ev.data).connected) {
+      if (typeof ev.data === "string" && /"type"\s*:\s*"(status|welcome)"/.test(ev.data) && !JSON.parse(ev.data).connected) {
+        departuresSeen++;
+        if (seal) seal.gone = true;
         cancelConfirm();
         void haltListening();
       }
@@ -677,7 +707,10 @@
     // Stay linked through network drops: redial this socket's URL until a newer connect() replaces it.
     ws.onclose = () => {
       if (ws !== mine) return;
-      cancelConfirm(); void haltListening(); agentHere = false; seal = null; challenge = null; pairing = null; clearTimeout(squatTimer);
+      if (seal) seal.gone = true;
+      cancelConfirm(); void haltListening(); agentHere = false; seal = null; challenge = null; pairing = null;
+      departuresSeen = 0; departuresHandled = 0;
+      clearTimeout(squatTimer);
       setStatus("disconnected, reconnecting");
       setTimeout(() => { if (ws === mine) connect(); }, 3000);
     };
