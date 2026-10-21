@@ -69,7 +69,7 @@ func Run(ctx context.Context, opt Options) error {
 
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "ambivalence",
-		Version: "0.2.2",
+		Version: "0.3.0",
 	}, nil)
 
 	mcp.AddTool(server, &mcp.Tool{

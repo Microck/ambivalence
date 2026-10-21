@@ -30,7 +30,7 @@ import (
 	"github.com/Microck/ambivalence/internal/protocol"
 )
 
-const version = "0.2.2"
+const version = "0.3.0"
 
 func main() {
 	log.SetFlags(0)
