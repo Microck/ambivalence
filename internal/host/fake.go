@@ -321,7 +321,7 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 				reply(protocol.Message{Type: protocol.TypeError, Err: err.Error()}, nil)
 				return
 			}
-			pcm := fakeTonePCM(0, int64(duration*rate/1000), rate)
+			pcm := fakeTonePCM(0, int64(duration)*int64(rate)/1000, rate)
 			level := audio.Level(pcm)
 			reply(protocol.Message{Mime: protocol.AudioMime, DurationMs: duration, SampleRate: rate, Levels: &level}, audio.EncodeWAV(pcm, rate))
 		case protocol.TypeAudioStart:
@@ -358,7 +358,7 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 			}
 			pcm, totalMs, ended := listen.take(ms)
 			level := audio.Level(pcm)
-			reply(protocol.Message{Mime: protocol.AudioMime, DurationMs: len(pcm) * 1000 / (listen.rate * 2), SampleRate: listen.rate, TotalMs: totalMs, Ended: ended, Levels: &level}, audio.EncodeWAV(pcm, listen.rate))
+			reply(protocol.Message{Mime: protocol.AudioMime, DurationMs: int(int64(len(pcm)) * 1000 / int64(listen.rate*2)), SampleRate: listen.rate, TotalMs: totalMs, Ended: ended, Levels: &level}, audio.EncodeWAV(pcm, listen.rate))
 		case protocol.TypeAudioStop:
 			if listen == nil || m.ListenID != listen.id {
 				reply(protocol.Message{Type: protocol.TypeError, Err: "no such audio session"}, nil)
@@ -367,14 +367,14 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 			avail, _ := listen.available()
 			totalMs := int(avail * 1000 / int64(listen.rate))
 			listen = nil
-			reply(protocol.Message{Type: protocol.TypeStatus, DurationMs: totalMs, TotalMs: totalMs, Ended: true}, nil)
+			reply(protocol.Message{Type: protocol.TypeStatus, Facing: facing, CameraID: cameraID, Settings: settings, Capabilities: capabilities, Torch: torch, Zoom: zoom, DurationMs: totalMs, TotalMs: totalMs, Ended: true, Connected: true}, nil)
 		case protocol.TypeLevel:
 			duration, rate, err := protocol.NormalizeAudio(m.DurationMs, m.SampleRate, 1000, protocol.MaxChunkMs)
 			if err != nil {
 				reply(protocol.Message{Type: protocol.TypeError, Err: err.Error()}, nil)
 				return
 			}
-			pcm := fakeTonePCM(0, int64(duration*rate/1000), rate)
+			pcm := fakeTonePCM(0, int64(duration)*int64(rate)/1000, rate)
 			level := audio.Level(pcm)
 			reply(protocol.Message{Type: protocol.TypeLevels, DurationMs: duration, SampleRate: rate, Levels: &level}, nil)
 		default:

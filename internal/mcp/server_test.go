@@ -2,10 +2,13 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/Microck/ambivalence/internal/hub"
 	"github.com/Microck/ambivalence/internal/link"
@@ -236,6 +239,8 @@ func TestConcurrentAudioListenStartsSerializeAndTrackLatestSession(t *testing.T)
 					_ = hostSess.SendSealed(hostSeal, protocol.Message{
 						ID:           inner.ID,
 						Type:         protocol.TypeCameras,
+						Facing:       "back",
+						CameraID:     "cam-back",
 						Capabilities: map[string]any{"audioVersion": float64(1)},
 					}, nil)
 				case protocol.TypeAudioStart:
@@ -254,6 +259,7 @@ func TestConcurrentAudioListenStartsSerializeAndTrackLatestSession(t *testing.T)
 					mu.Lock()
 					stops = append(stops, inner.ListenID)
 					mu.Unlock()
+					// Omit Connected and camera fields in audio_stop status ack, matching mobile hosts.
 					_ = hostSess.SendSealed(hostSeal, protocol.Message{
 						ID:    inner.ID,
 						Type:  protocol.TypeStatus,
@@ -295,5 +301,26 @@ func TestConcurrentAudioListenStartsSerializeAndTrackLatestSession(t *testing.T)
 	s.mu.Unlock()
 	if trackedID != wantID {
 		t.Fatalf("tracked audioListenID = %q, want latest active session %q", trackedID, wantID)
+	}
+
+	// Stopping the active audio session must not clear the cached connection status.
+	stopRes, _, err := s.audioListenStop(ctx, nil, struct{}{})
+	if err != nil || stopRes == nil || stopRes.IsError {
+		t.Fatalf("audioListenStop failed: res=%v err=%v", stopRes, err)
+	}
+	statusRes, _, err := s.cameraStatus(ctx, nil, struct{}{})
+	if err != nil || statusRes == nil || statusRes.IsError {
+		t.Fatalf("cameraStatus failed: res=%v err=%v", statusRes, err)
+	}
+	tc, ok := statusRes.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("expected TextContent from cameraStatus, got %T", statusRes.Content[0])
+	}
+	var status protocol.Message
+	if err := json.Unmarshal([]byte(tc.Text), &status); err != nil {
+		t.Fatalf("unmarshal cameraStatus: %v", err)
+	}
+	if !status.Connected {
+		t.Fatalf("cameraStatus reported connected=false after audioListenStop: %+v", status)
 	}
 }

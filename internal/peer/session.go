@@ -683,6 +683,25 @@ func (s *Session) readLoop() {
 		}
 		if msg.Type == protocol.TypeStatus || msg.Type == protocol.TypeWelcome {
 			s.statMu.Lock()
+			if s.hostCh == nil && msg.ID != "" && msg.Type == protocol.TypeStatus {
+				prev := s.status
+				msg.Connected = true
+				if msg.Code == "" {
+					msg.Code = prev.Code
+				}
+				if msg.Host == nil {
+					msg.Host = prev.Host
+				}
+				if msg.CameraID == "" && msg.Facing == "" {
+					msg.Facing = prev.Facing
+					msg.CameraID = prev.CameraID
+					msg.Torch = prev.Torch
+					msg.Zoom = prev.Zoom
+					msg.Settings = prev.Settings
+					msg.Capabilities = prev.Capabilities
+					msg.Cameras = prev.Cameras
+				}
+			}
 			s.status = msg
 			s.statMu.Unlock()
 		}

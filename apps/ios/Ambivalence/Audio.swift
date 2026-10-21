@@ -213,9 +213,10 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
             let ended = !r.isRecording && (size <= readOffset || size - readOffset < 2)
             let dataBytes = (size > origin ? size - origin : 0) & ~1
             let total = Int(dataBytes * 1000 / UInt64(rate * 2))
+            let durationMs = Int(UInt64(pcm.count) * 1000 / UInt64(rate * 2))
             let meta: [String: Any] = [
                 "mime": "audio/wav", "bytes": 44 + pcm.count,
-                "durationMs": pcm.count * 1000 / (rate * 2), "sampleRate": rate,
+                "durationMs": durationMs, "sampleRate": rate,
                 "totalMs": total, "ended": ended, "levels": Self.levels(pcm),
             ]
             out = (meta, Self.wav(pcm, rate: rate))
@@ -297,7 +298,7 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
         file = nil
         id = nil
         owner = nil
-        return (["durationMs": total, "totalMs": total, "ended": true], url, gen)
+        return (["durationMs": total, "totalMs": total, "ended": true, "connected": true], url, gen)
     }
 
     // Deactivates the session and clears the indicator only if no newer recording has started

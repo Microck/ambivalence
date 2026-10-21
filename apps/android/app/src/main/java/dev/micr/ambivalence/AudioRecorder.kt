@@ -60,6 +60,18 @@ class AudioRecorder(private val dir: File) {
         }
     }
 
+    internal fun seedEndedSessionForTest(owner: String, id: String, rate: Int, pcmBytes: Int) {
+        val file = File.createTempFile("audio-test-", ".pcm", dir)
+        RandomAccessFile(file, "rw").use { it.setLength(pcmBytes.toLong()) }
+        synchronized(lock) {
+            val s = Session(id, owner, file, rate, pcmBytes.toLong(), ++sessionGen)
+            s.written = pcmBytes.toLong()
+            s.ended = true
+            s.stopNotified = true
+            session = s
+        }
+    }
+
     fun start(owner: String, maxDurationMs: Int, sampleRate: Int, cancelled: () -> Boolean = { false }): JSONObject {
         val token = stopToken(owner)
         if (cancelled()) throw IllegalStateException("audio session cancelled")
@@ -176,7 +188,7 @@ class AudioRecorder(private val dir: File) {
             }
             val level = levels(pcm)
             val meta = JSONObject()
-                .put("mime", "audio/wav").put("bytes", 44 + pcm.size).put("durationMs", pcm.size * 1000 / (s.rate * 2))
+                .put("mime", "audio/wav").put("bytes", 44 + pcm.size).put("durationMs", chunkDurationMs(pcm.size, s.rate))
                 .put("sampleRate", s.rate).put("totalMs", totalMs).put("ended", ended)
                 .put("levels", level)
             return meta to wav(pcm, s.rate)
@@ -230,7 +242,7 @@ class AudioRecorder(private val dir: File) {
         }
         finish(s)
         val totalMs = (s.written * 1000 / (s.rate * 2)).toInt()
-        return JSONObject().put("durationMs", totalMs).put("totalMs", totalMs).put("ended", true)
+        return JSONObject().put("durationMs", totalMs).put("totalMs", totalMs).put("ended", true).put("connected", true)
     }
 
     /** Stops whatever session is active, regardless of owner. Only for app teardown. */
@@ -241,7 +253,7 @@ class AudioRecorder(private val dir: File) {
         }
         finish(s)
         val totalMs = (s.written * 1000 / (s.rate * 2)).toInt()
-        return JSONObject().put("durationMs", totalMs).put("totalMs", totalMs).put("ended", true)
+        return JSONObject().put("durationMs", totalMs).put("totalMs", totalMs).put("ended", true).put("connected", true)
     }
 
     // Detaches and finishes the current session. Caller holds [lifecycleLock], so the old
@@ -306,6 +318,10 @@ class AudioRecorder(private val dir: File) {
     }
 
     companion object {
+        /** Converts a 16-bit mono PCM byte count at [rate] Hz into milliseconds using 64-bit arithmetic. */
+        fun chunkDurationMs(pcmBytes: Int, rate: Int): Int =
+            (pcmBytes.toLong() * 1000L / (rate.toLong() * 2L)).toInt()
+
         /**
          * Acquires [lock] for up to [timeoutMs] while polling [cancelled], then runs [work] only
          * if [cancelled] is still false once the permit is held.

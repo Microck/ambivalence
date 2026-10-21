@@ -51,6 +51,34 @@ class HubClientInteropTest {
         }
     }
 
+    @Test fun maxChunkDurationDoesNotOverflowAtHighSampleRates() {
+        val dir = Files.createTempDirectory("ambivalence-audio-duration-test").toFile()
+        try {
+            val recorder = AudioRecorder(dir)
+
+            // 30 seconds of 16-bit mono PCM at 48 kHz = 2,880,000 bytes (2,880,000 * 1000 overflows Int).
+            recorder.seedEndedSessionForTest("owner", "id-48k", 48_000, 2_880_000)
+            val (meta48k, wav48k) = recorder.read("owner", "id-48k", 30_000)
+            assertEquals(30_000, meta48k.getInt("durationMs"))
+            assertEquals(30_000, meta48k.getInt("totalMs"))
+            assertEquals(44 + 2_880_000, wav48k.size)
+
+            // 30 seconds of 16-bit mono PCM at 44.1 kHz = 2,646,000 bytes (2,646,000 * 1000 overflows Int).
+            recorder.seedEndedSessionForTest("owner", "id-44k1", 44_100, 2_646_000)
+            val (meta44k1, wav44k1) = recorder.read("owner", "id-44k1", 30_000)
+            assertEquals(30_000, meta44k1.getInt("durationMs"))
+            assertEquals(30_000, meta44k1.getInt("totalMs"))
+            assertEquals(44 + 2_646_000, wav44k1.size)
+
+            // Stop ack preserves connected=true so agent status cache does not flip to disconnected.
+            recorder.seedEndedSessionForTest("owner", "id-stop", 16_000, 32_000)
+            val stopped = recorder.stop("owner", "id-stop")
+            assertTrue(stopped.getBoolean("connected"))
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
     @Test fun queuedListenAfterDepartureDoesNotOpenMicrophone() {
         val identity = Identity(MemoryPrefs())
         val key = ByteArray(32) { (it + 1).toByte() }
@@ -293,7 +321,7 @@ class HubClientInteropTest {
         override fun audioStop(owner: String, listenId: String?): JSONObject {
             audioStopCalls++
             lastStopOwner = owner
-            return JSONObject().put("durationMs", 0).put("totalMs", 0).put("ended", true)
+            return JSONObject().put("durationMs", 0).put("totalMs", 0).put("ended", true).put("connected", true)
         }
 
         override fun level(owner: String, durationMs: Int, sampleRate: Int, cancelled: () -> Boolean): JSONObject =
