@@ -29,6 +29,7 @@ type Options struct {
 type Server struct {
 	opt     Options
 	hub     *hub.Hub
+	audioMu sync.Mutex // serializes audio lifecycle calls so concurrent starts cannot invert audioListenID
 	mu      sync.Mutex
 	agent   *peer.Session
 	hubURL  string
@@ -287,6 +288,18 @@ func (s *Server) dropAgent() {
 	}
 }
 
+func (s *Server) dropAgentIf(sess *peer.Session) {
+	if sess != nil {
+		_ = sess.Close()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.agent == sess {
+		s.audioListenID = ""
+		s.agent = nil
+	}
+}
+
 // connect replaces the current session with one to the saved linked phone.
 func (s *Server) connect(ctx context.Context, hubURL string) (*peer.Session, error) {
 	s.dropAgent()
@@ -340,6 +353,8 @@ func (s *Server) audioRecord(ctx context.Context, _ *mcp.CallToolRequest, args a
 	if duration < 100 || duration > protocol.MaxOneShotAudioMs {
 		return errResult(fmt.Errorf("duration must be between 100 and %d ms", protocol.MaxOneShotAudioMs)), nil, nil
 	}
+	s.audioMu.Lock()
+	defer s.audioMu.Unlock()
 	sess, err := s.requireAgent(ctx)
 	if err != nil {
 		return errResult(err), nil, nil
@@ -358,7 +373,7 @@ func (s *Server) audioRecord(ctx context.Context, _ *mcp.CallToolRequest, args a
 	fr, err := sess.Listen(cctx, duration, 0)
 	if err != nil {
 		if cctx.Err() != nil || !sess.Alive() {
-			s.dropAgent()
+			s.dropAgentIf(sess)
 		}
 		return errResult(err), nil, nil
 	}
@@ -373,6 +388,8 @@ func (s *Server) audioListenStart(ctx context.Context, _ *mcp.CallToolRequest, a
 	if maxMs < 0 || maxMs > protocol.MaxSessionMs {
 		return errResult(fmt.Errorf("max duration must be between 0 and %d ms", protocol.MaxSessionMs)), nil, nil
 	}
+	s.audioMu.Lock()
+	defer s.audioMu.Unlock()
 	sess, err := s.requireAgent(ctx)
 	if err != nil {
 		return errResult(err), nil, nil
@@ -389,13 +406,22 @@ func (s *Server) audioListenStart(ctx context.Context, _ *mcp.CallToolRequest, a
 	started, err := sess.AudioStart(cctx, maxMs, 0)
 	if err != nil {
 		if cctx.Err() != nil || !sess.Alive() {
-			s.dropAgent()
+			s.dropAgentIf(sess)
 		}
 		return errResult(err), nil, nil
 	}
 	s.mu.Lock()
-	s.audioListenID = started.ListenID
+	active := s.agent == sess && sess.Alive()
+	if active {
+		s.audioListenID = started.ListenID
+	}
 	s.mu.Unlock()
+	if !active {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, _ = sess.AudioStop(stopCtx, started.ListenID)
+		stopCancel()
+		return errResult(fmt.Errorf("audio session cancelled")), nil, nil
+	}
 	limit := "until stopped"
 	if started.MaxDurationMs > 0 {
 		limit = fmt.Sprintf("max %.1fs", float64(started.MaxDurationMs)/1000)
@@ -428,7 +454,7 @@ func (s *Server) audioListenNext(ctx context.Context, _ *mcp.CallToolRequest, ar
 	fr, err := sess.AudioRead(cctx, id, chunk)
 	if err != nil {
 		if cctx.Err() != nil || !sess.Alive() {
-			s.dropAgent()
+			s.dropAgentIf(sess)
 		}
 		return errResult(err), nil, nil
 	}
@@ -447,6 +473,8 @@ func (s *Server) audioListenNext(ctx context.Context, _ *mcp.CallToolRequest, ar
 }
 
 func (s *Server) audioListenStop(ctx context.Context, _ *mcp.CallToolRequest, _ emptyArgs) (*mcp.CallToolResult, any, error) {
+	s.audioMu.Lock()
+	defer s.audioMu.Unlock()
 	id := s.takeListenID()
 	if id == "" {
 		return errResult(fmt.Errorf("no active listening session")), nil, nil
@@ -460,7 +488,7 @@ func (s *Server) audioListenStop(ctx context.Context, _ *mcp.CallToolRequest, _ 
 	meta, err := sess.AudioStop(cctx, id)
 	if err != nil {
 		if cctx.Err() != nil || !sess.Alive() {
-			s.dropAgent()
+			s.dropAgentIf(sess)
 		}
 		return errResult(err), nil, nil
 	}
@@ -476,6 +504,8 @@ func (s *Server) audioLevel(ctx context.Context, _ *mcp.CallToolRequest, args le
 	if duration < 100 || duration > protocol.MaxChunkMs {
 		return errResult(fmt.Errorf("duration must be between 100 and %d ms", protocol.MaxChunkMs)), nil, nil
 	}
+	s.audioMu.Lock()
+	defer s.audioMu.Unlock()
 	sess, err := s.requireAgent(ctx)
 	if err != nil {
 		return errResult(err), nil, nil
@@ -494,7 +524,7 @@ func (s *Server) audioLevel(ctx context.Context, _ *mcp.CallToolRequest, args le
 	fr, err := sess.Level(cctx, duration)
 	if err != nil {
 		if cctx.Err() != nil || !sess.Alive() {
-			s.dropAgent()
+			s.dropAgentIf(sess)
 		}
 		return errResult(err), nil, nil
 	}
@@ -512,7 +542,7 @@ func (s *Server) stopListening(sess *peer.Session) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if _, err := sess.AudioStop(ctx, id); err != nil && (ctx.Err() != nil || !sess.Alive()) {
-		s.dropAgent()
+		s.dropAgentIf(sess)
 	}
 }
 
@@ -658,14 +688,10 @@ func rewriteLocal(addr string) string {
 		return addr
 	}
 	// A wildcard listen address is not dialable; reach the local hub over loopback.
-	if host == "0.0.0.0" || host == "::" || host == "" {
-		host = "127.0.0.1"
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return net.JoinHostPort("127.0.0.1", port)
 	}
-	return net.JoinHostPort(host, port)
-}
-
-func init() {
-	log.SetOutput(os.Stderr)
+	return addr
 }
 
 func (s *Server) cameraConfigure(ctx context.Context, _ *mcp.CallToolRequest, args protocol.Controls) (*mcp.CallToolResult, any, error) {
@@ -673,4 +699,11 @@ func (s *Server) cameraConfigure(ctx context.Context, _ *mcp.CallToolRequest, ar
 		return errResult(err), nil, nil
 	}
 	return s.command(ctx, protocol.Message{Controls: &args})
+}
+
+func DefaultHubURL() string {
+	if v := os.Getenv("AMBIVALENCE_HUB"); v != "" {
+		return v
+	}
+	return config.HubURL("")
 }

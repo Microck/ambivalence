@@ -13,6 +13,14 @@ import (
 	"github.com/Microck/ambivalence/internal/protocol"
 )
 
+func TestCmdListenRejectsPositiveSubMinimumDurationBeforeDialing(t *testing.T) {
+	for _, arg := range []string{"500us", "1ns", "50ms", "99ms", "-1s"} {
+		if err := cmdListen([]string{"--duration", arg}); err == nil {
+			t.Fatalf("cmdListen(--duration %s) succeeded, want validation error", arg)
+		}
+	}
+}
+
 func TestAudioDrainDeadlineLeavesRoomForTheBufferedTail(t *testing.T) {
 	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
 

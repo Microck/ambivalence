@@ -263,10 +263,13 @@ func cmdListen(args []string) error {
 	if *duration < 0 {
 		return fmt.Errorf("duration cannot be negative")
 	}
-	maxMs := int(*duration / time.Millisecond)
-	if maxMs > protocol.MaxSessionMs {
+	if *duration > 0 && *duration < 100*time.Millisecond {
+		return fmt.Errorf("duration must be 0 or at least 100ms")
+	}
+	if *duration > time.Duration(protocol.MaxSessionMs)*time.Millisecond {
 		return fmt.Errorf("duration %s exceeds the %s session limit; start another recording after it", *duration, time.Duration(protocol.MaxSessionMs)*time.Millisecond)
 	}
+	maxMs := int(*duration / time.Millisecond)
 	sess, closer, err := agentSession(*hubURL, *code)
 	if err != nil {
 		return err
