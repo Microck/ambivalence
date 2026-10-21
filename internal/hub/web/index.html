@@ -138,7 +138,9 @@
   let ws, stream, cameraSelection = null, facing = "environment", torchOn = false, zoomLevel = 1;
   // One continuous microphone session at a time. Audio is captured as Float32 frames and
   // drained by audio_read, so a slow agent never loses what was recorded meanwhile.
-  let listen = null;
+  // listenGen invalidates an in-flight getUserMedia() if the agent leaves or the socket drops
+  // while the user is still responding to the microphone permission prompt.
+  let listen = null, listenGen = 0;
   // Per-agent state, reset when an agent arrives or leaves. seal is set once the agent proved
   // the link; only requests sealed under it may touch the camera.
   let agentHere = false, seal = null, challenge = null, pairing = null, squatTimer = null;
@@ -311,10 +313,20 @@
   async function startListening(maxDurationMs) {
     if (!navigator.mediaDevices || !window.isSecureContext) throw new Error(audioError);
     await haltListening();
+    const gen = ++listenGen;
     const mic = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    if (gen !== listenGen) {
+      mic.getTracks().forEach(t => t.stop());
+      throw new Error("audio session cancelled");
+    }
     const Ctx = window.AudioContext || window.webkitAudioContext;
     const ctx = new Ctx();
     try { await ctx.resume(); } catch {}
+    if (gen !== listenGen) {
+      mic.getTracks().forEach(t => t.stop());
+      try { await ctx.close(); } catch {}
+      throw new Error("audio session cancelled");
+    }
     const source = ctx.createMediaStreamSource(mic);
     const proc = ctx.createScriptProcessor(4096, 1, 1);
     const sink = ctx.createGain();
@@ -357,6 +369,7 @@
   }
 
   async function haltListening() {
+    listenGen++;
     const s = listen;
     listen = null;
     if (s) {
