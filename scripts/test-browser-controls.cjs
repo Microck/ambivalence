@@ -428,3 +428,55 @@ test('disconnect while AudioContext.resume is pending immediately stops micropho
   assert.equal(stopped, 1);
   assert.equal(rec.hidden, true);
 });
+
+// Real channel encryption and the shipped receiver/device queue exercise the timeout boundary.
+test('authenticated stop interrupts a 30-second browser read and preserves reply order', async () => {
+  const replies = [];
+  let stopped = 0;
+  const rec = { hidden: false };
+  const context = vm.createContext({
+    crypto: require('node:crypto').webcrypto, TextEncoder, TextDecoder,
+    Uint8Array, Float32Array, DataView, btoa, atob, setTimeout, clearTimeout,
+    enc: new TextEncoder(), ident: { device: 'fixture' }, $: () => rec,
+    ws: { send(frame) { replies.push(frame); } }, stream: null,
+    facing: 'environment', torchOn: false, zoomLevel: 1,
+    controlCapabilities: () => ({}), controlSettings: () => ({}),
+  });
+  vm.runInContext(
+    html.slice(html.indexOf('  async function H('), html.indexOf('  // Ask the user')) +
+    html.slice(html.indexOf('  const seqBytes ='), html.indexOf('  let code =')) +
+    'let listen = null, listenGen = 0, agentHere = true, seal = null, challenge = null, pairing = null, squatTimer = null, departuresSeen = 0, departuresHandled = 0, agentGen = 0, outbox = Promise.resolve();\n' +
+    html.slice(html.indexOf('  const showRec ='), html.indexOf('  function connect()')),
+    context,
+  );
+  const phone = await context.makeSeal(new Uint8Array(32), new Uint8Array(16), new Uint8Array(16));
+  const agentTx = { k: phone.rx.k, seq: 0n };
+  const live = { id: 'active', rate: 16000, frames: 1600, read: 0,
+    chunks: [new Float32Array(1600)], ended: false, halted: false,
+    mic: { getTracks: () => [{ stop() { stopped++; } }] }, ctx: { close: async () => {} } };
+  context.phone = phone; context.live = live;
+  vm.runInContext('seal = phone; listen = live;', context);
+  async function request(inner) {
+    const box = await context.sealBox(agentTx, new TextEncoder().encode(JSON.stringify(inner)));
+    await context.onMessage({ data: JSON.stringify({ type: 'sealed', id: inner.id, box: Buffer.from(box).toString('base64') }) });
+  }
+  await request({ type: 'audio_read', id: 'read', listenId: 'active', durationMs: 30000 });
+  await new Promise(r => setImmediate(r));
+  assert.equal(replies.length, 0, 'read must still be waiting');
+  await request({ type: 'audio_stop', id: 'stop', listenId: 'active' });
+  await vm.runInContext('cameraTurn', context);
+  await vm.runInContext('outbox', context);
+  assert.equal(stopped, 1);
+  assert.equal(rec.hidden, true);
+  const agentRx = { k: phone.tx.k, seq: 0n };
+  const decoded = [];
+  for (const frame of replies) {
+    const box = typeof frame === 'string' ? Buffer.from(JSON.parse(frame).box, 'base64') : frame;
+    const plain = await context.openBox(agentRx, new Uint8Array(box));
+    if (typeof frame === 'string') decoded.push(JSON.parse(new TextDecoder().decode(plain)));
+  }
+  assert.deepEqual(decoded.map(x => x.id), ['read', 'stop']);
+  assert.equal(decoded[0].durationMs, 100);
+  assert.equal(decoded[0].ended, true);
+  assert.equal(decoded[1].connected, true);
+});

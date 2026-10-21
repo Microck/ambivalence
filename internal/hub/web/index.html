@@ -562,7 +562,13 @@
           let inner;
           try { inner = JSON.parse(new TextDecoder().decode(await openBox(s.rx, unb64(m.box)))); } catch { return; } // forged or replayed by the hub
           if (inner.id !== m.id || !activeSeal(s)) return;
-          try { await camera(s, inner); } catch (e) { if (activeSeal(s)) sendSealed(s, { type: "error", id: inner.id, error: e.message || String(e) }); }
+          // Do not await cameraTurn inside inbox: an in-flight audio_read can wait up to 30s,
+          // and an incoming audio_stop must decrypt and wake readAudio
+          // immediately while still running its reply handler in order on cameraTurn.
+          if (inner.type === "audio_stop" && listen && (!inner.listenId || listen.id === inner.listenId)) {
+            void haltMic(listen);
+          }
+          camera(s, inner).catch(e => { if (activeSeal(s)) sendSealed(s, { type: "error", id: inner.id, error: e.message || String(e) }); });
           return;
         }
         // Unsealed camera requests never count, even after auth: a hub could inject them.

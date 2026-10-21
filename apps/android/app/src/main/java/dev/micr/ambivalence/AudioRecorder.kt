@@ -60,14 +60,14 @@ class AudioRecorder(private val dir: File) {
         }
     }
 
-    internal fun seedEndedSessionForTest(owner: String, id: String, rate: Int, pcmBytes: Int) {
+    internal fun seedEndedSessionForTest(owner: String, id: String, rate: Int, pcmBytes: Int, ended: Boolean = true) {
         val file = File.createTempFile("audio-test-", ".pcm", dir)
         RandomAccessFile(file, "rw").use { it.setLength(pcmBytes.toLong()) }
         synchronized(lock) {
             val s = Session(id, owner, file, rate, pcmBytes.toLong(), ++sessionGen)
             s.written = pcmBytes.toLong()
-            s.ended = true
-            s.stopNotified = true
+            s.ended = ended
+            s.stopNotified = ended
             session = s
         }
     }
@@ -224,6 +224,23 @@ class AudioRecorder(private val dir: File) {
         } finally {
             runCatching { stop(owner, id) }
         }
+    }
+
+    /**
+     * Marks [owner]'s active session (matching [id] when non-null) as ending so an in-flight
+     * [read] wakes and returns its partial chunk immediately without detaching [session] before
+     * the queued [stop] runs on the device worker.
+     */
+    fun finishReadEarly(owner: String, id: String?): Unit = synchronized(lock) {
+        val cur = session ?: return
+        if (cur.owner != owner || (id != null && cur.id != id)) return
+        cur.stopping = true
+        cur.ended = true
+        if (sessionGen == cur.gen && !cur.stopNotified) {
+            cur.stopNotified = true
+            onRecording?.invoke(false)
+        }
+        runCatching { cur.record?.stop() }
     }
 
     /**

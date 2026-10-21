@@ -57,6 +57,9 @@ interface CameraHost {
     /** Stops [owner]'s session with this id, or any session owned by [owner] when null (agent left). */
     fun audioStop(owner: String, listenId: String?): JSONObject
 
+    /** Wakes an in-flight [audioRead] for [owner]'s session so a queued stop can run immediately. */
+    fun audioInterruptRead(owner: String, listenId: String?)
+
     fun level(owner: String, durationMs: Int, sampleRate: Int, cancelled: () -> Boolean = { false }): JSONObject
 }
 
@@ -104,18 +107,20 @@ class HubClient(
         private set
 
     private val inbox = Executors.newSingleThreadScheduledExecutor()
+    // Device work is serial, but never parks the authenticated message receiver.
+    private val deviceWork = Executors.newSingleThreadExecutor()
     @Volatile private var socket: WebSocket? = null
     @Volatile private var stopped = false
     @Volatile private var pendingConfirm: CompletableFuture<Boolean>? = null
     @Volatile private var confirmGone = false // the prompt closed because the agent or socket went away
     private val departuresSeen = AtomicInteger(0)
-    private var departuresHandled = 0
+    @Volatile private var departuresHandled = 0
     private val writeLock = Any()
 
     // Per-agent state, inbox thread only: reset whenever an agent arrives or leaves. seal is set
     // once the agent has proven the link; only messages sealed under it may touch the camera.
     private var agentHere = false
-    private var seal: Seal? = null
+    @Volatile private var seal: Seal? = null
     private var challenge: ByteArray? = null
     private var pairing: Party? = null
     private var pairNB = ByteArray(0)
@@ -141,6 +146,7 @@ class HubClient(
         socket = null
         live = false
         inbox.shutdownNow()
+        deviceWork.shutdownNow()
     }
 
     /**
@@ -175,9 +181,8 @@ class HubClient(
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                // The inbox may be blocked on the pairing screen or in an audio read; act on the
-                // socket thread so an agent leaving cancels the prompt and stops our microphone
-                // without queueing behind a chunk that can run for up to 30 s.
+                // A pairing prompt can block the inbox. Notice departures on the socket
+                // thread so the prompt and microphone close immediately.
                 val m = runCatching { JSONObject(text) }.getOrNull()
                 if (webSocket === socket && isDeparture(m)) {
                     departuresSeen.incrementAndGet()
@@ -408,7 +413,10 @@ class HubClient(
             return // forged or replayed by the hub: ignore it, keep serving the real agent
         }
         if (inner.optString("id") != id || agentGone) return
-        serve(s, inner)
+        if (inner.optString("type") == "audio_stop") {
+            camera.audioInterruptRead(owner, inner.optString("listenId").takeIf { it.isNotEmpty() })
+        }
+        deviceWork.execute { serve(s, inner) }
     }
 
     // Serves one opened request; every reply goes back sealed under the session it came in on.

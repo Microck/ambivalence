@@ -297,7 +297,7 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
 
     private fun fail(msg: String): Nothing = throw IllegalStateException(msg)
 
-    // Audio work blocks the connection's inbox thread until the chunk is full, just like a
+    // Audio work blocks the connection's device worker until the chunk is full, just like a
     // capture blocks on the camera. The permission is checked per call so a user who revoked
     // it in Settings gets a clear error instead of a silent empty recording.
     private fun <T> withAudio(cancelled: () -> Boolean = { false }, work: () -> T): T {
@@ -319,12 +319,10 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
         audio.read(owner, listenId, maxMs.coerceIn(100, 30000), cancelled)
     }
 
-    override fun audioStop(owner: String, listenId: String?): JSONObject {
-        // An agent left: stop immediately even if a read is blocked holding the audio lock.
-        // AudioRecorder has its own lock, so this is safe and keeps the microphone from
-        // outliving the session.
-        if (listenId == null) return audio.stop(owner, null)
-        return withAudio { audio.stop(owner, listenId) }
+    override fun audioStop(owner: String, listenId: String?): JSONObject = audio.stop(owner, listenId)
+
+    override fun audioInterruptRead(owner: String, listenId: String?) {
+        audio.finishReadEarly(owner, listenId)
     }
 
     override fun level(owner: String, durationMs: Int, sampleRate: Int, cancelled: () -> Boolean): JSONObject = withAudio(cancelled) {

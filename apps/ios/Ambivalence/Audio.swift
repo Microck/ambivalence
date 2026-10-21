@@ -266,6 +266,14 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
         return result.meta
     }
 
+    /// Stops capture while retaining the file and session for the pending read and stop reply.
+    func finishReadEarly(owner: String, id: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard self.owner == owner, id == nil || id == self.id, let r = recorder else { return }
+        r.stop()
+    }
+
     /// Privacy: every agent departure or socket loss closes the microphone its connection owns.
     func stopAll(owner: String) {
         _ = try? stop(owner: owner, id: nil)

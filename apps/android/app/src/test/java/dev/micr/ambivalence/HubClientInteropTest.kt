@@ -79,6 +79,34 @@ class HubClientInteropTest {
         }
     }
 
+    @Test fun stopInterruptsPendingReadAndRetainsPartialChunk() {
+        val dir = Files.createTempDirectory("ambivalence-audio-interrupt-test").toFile()
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val recorder = AudioRecorder(dir)
+        try {
+            recorder.seedEndedSessionForTest("owner", "active", 16_000, 3200, ended = false)
+            val read = executor.submit<Pair<JSONObject, ByteArray>> { recorder.read("owner", "active", 30_000) }
+            // A different connection or session must not interrupt this read.
+            recorder.finishReadEarly("other-owner", "active")
+            recorder.finishReadEarly("owner", "other-session")
+            try {
+                read.get(100, TimeUnit.MILLISECONDS)
+                throw AssertionError("another owner or session interrupted the read")
+            } catch (_: java.util.concurrent.TimeoutException) {
+                // The read remains pending until its own session receives stop.
+            }
+            recorder.finishReadEarly("owner", "active")
+            val (meta, wav) = read.get(2, TimeUnit.SECONDS)
+            assertEquals(100, meta.getInt("durationMs"))
+            assertTrue(meta.getBoolean("ended"))
+            assertEquals(3244, wav.size)
+            assertTrue(recorder.stop("owner", "active").getBoolean("connected"))
+        } finally {
+            executor.shutdownNow()
+            dir.deleteRecursively()
+        }
+    }
+
     @Test fun queuedListenAfterDepartureDoesNotOpenMicrophone() {
         val identity = Identity(MemoryPrefs())
         val key = ByteArray(32) { (it + 1).toByte() }
@@ -130,7 +158,7 @@ class HubClientInteropTest {
         val departuresSeenField = HubClient::class.java.getDeclaredField("departuresSeen").apply { isAccessible = true }
         val departuresSeen = departuresSeenField.get(client) as AtomicInteger
 
-        // 1. Enqueue a capture that blocks the inbox thread.
+        // 1. Enqueue a capture that blocks the device worker.
         val capMsg = sealedMsg("cap-1", JSONObject().put("type", "capture"))
         postMethod.invoke(client, { handleMethod.invoke(client, capMsg) })
         assertTrue(enterCapture.await(5, TimeUnit.SECONDS))
@@ -139,7 +167,7 @@ class HubClientInteropTest {
         val listenMsg = sealedMsg("listen-1", JSONObject().put("type", "listen").put("durationMs", 60000))
         postMethod.invoke(client, { handleMethod.invoke(client, listenMsg) })
 
-        // 3. Agent departs while capture is still running on the inbox thread.
+        // 3. Agent departs while capture is still running on the device worker.
         departuresSeen.incrementAndGet()
         val depMsg = JSONObject().put("type", "status").put("connected", false).toString()
         postMethod.invoke(client, { handleMethod.invoke(client, depMsg) })
@@ -149,6 +177,10 @@ class HubClientInteropTest {
         val done = CountDownLatch(1)
         postMethod.invoke(client, { done.countDown() })
         assertTrue(done.await(5, TimeUnit.SECONDS))
+        val deviceDone = CountDownLatch(1)
+        val worker = HubClient::class.java.getDeclaredField("deviceWork").apply { isAccessible = true }.get(client) as java.util.concurrent.ExecutorService
+        worker.execute { deviceDone.countDown() }
+        assertTrue(deviceDone.await(5, TimeUnit.SECONDS))
 
         assertEquals("queued listen must not run after departure", 0, camera.listenCalls)
         client.disconnect()
@@ -222,6 +254,10 @@ class HubClientInteropTest {
         val done = CountDownLatch(1)
         postMethod.invoke(client, { done.countDown() })
         assertTrue(done.await(5, TimeUnit.SECONDS))
+        val deviceDone = CountDownLatch(1)
+        val worker = HubClient::class.java.getDeclaredField("deviceWork").apply { isAccessible = true }.get(client) as java.util.concurrent.ExecutorService
+        worker.execute { deviceDone.countDown() }
+        assertTrue(deviceDone.await(5, TimeUnit.SECONDS))
 
         assertEquals("listen waiting on semaphore must not open microphone after departure", 0, openedAfterSemaphore.get())
         client.disconnect()
@@ -311,6 +347,9 @@ class HubClientInteropTest {
             listenCalls++
             return JSONObject().put("mime", "audio/wav").put("durationMs", durationMs).put("sampleRate", sampleRate).put("levels", JSONObject().put("rmsDb", -100).put("peakDb", -100)) to ByteArray(44)
         }
+
+        // This fixture returns reads immediately, so there is no pending read to interrupt.
+        override fun audioInterruptRead(owner: String, listenId: String?) {}
 
         override fun audioStart(owner: String, maxDurationMs: Int, sampleRate: Int, cancelled: () -> Boolean): JSONObject =
             JSONObject().put("listenId", "fake").put("sampleRate", sampleRate).put("maxDurationMs", maxDurationMs)

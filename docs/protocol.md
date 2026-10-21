@@ -110,6 +110,8 @@ Continuous session:
 {"v":1,"id":"…","type":"status","durationMs":24000,"totalMs":24000,"ended":true}
 ```
 
+An authenticated `audio_stop` interrupts a pending `audio_read` for the same session immediately. The read returns the available partial chunk before the stop acknowledgement. Authentication and device operations retain arrival order; a waiting read must not block reception of stop requests.
+
 `audio_read` waits until the requested chunk is full, the session ends, or 5 seconds past the chunk length, then returns what is available. `ended` is true only when the session stopped and no unread audio remains, so a final short chunk still arrives before the end marker. `durationMs` is the returned chunk length; `totalMs` is the session length so far.
 
 Limits: `durationMs` 100–60000 for `listen`, 100–30000 for `audio_read` and `level`; `maxDurationMs` 0–7200000, where 0 records until `audio_stop` or until the phone runs out of space. A new `listen` or `audio_start` replaces an open session. The microphone stops whenever the agent leaves or the socket drops, and while it is open the app shows a recording indicator.

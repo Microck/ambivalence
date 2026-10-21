@@ -34,6 +34,7 @@ actor HubConnection {
     private var seal: Seal?
     private var challenge: Data?
     private var pairing: Pairing?
+    private var deviceWork: Task<Void, Never>?
     private var agentGen = 0 // bumps on every reset, so a stale squat timer does nothing
 
     private struct Pairing {
@@ -148,7 +149,7 @@ actor HubConnection {
 
     private func agentLeft() {
         departuresSeen += 1
-        // The serial handler may be parked in an audio read; stop this connection's microphone
+        // The device worker may be parked in an audio read; stop this connection's microphone
         // from the reader so an agent departure silences it at once instead of after the chunk.
         audio.stopAll(owner: owner)
         cancelPrompt()
@@ -306,6 +307,19 @@ actor HubConnection {
         guard let box = Data(base64Encoded: m["box"] as? String ?? ""), let plain = try? s.rx.open(box),
               let inner = (try? JSONSerialization.jsonObject(with: plain)) as? [String: Any],
               inner["id"] as? String ?? "" == id else { return }
+        if inner["type"] as? String == "audio_stop", let listenID = inner["listenId"] as? String {
+            audio.finishReadEarly(owner: owner, id: listenID)
+        }
+        // Authentication stays on the inbox; device work waits only for earlier device work.
+        let previous = deviceWork
+        deviceWork = Task {
+            await previous?.value
+            guard gen == agentGen, !agentGone else { return }
+            await serve(s, id: id, inner: inner, gen: gen, stopToken: stopToken)
+        }
+    }
+
+    private func serve(_ s: Seal, id: String, inner: [String: Any], gen: Int, stopToken: Int) async {
         do {
             var reply: [String: Any]
             var payload: Data?

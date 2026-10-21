@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"image/jpeg"
 	"net"
 	"net/http"
@@ -162,6 +163,41 @@ func TestAudioClipAndSession(t *testing.T) {
 	level, err := sess.Level(ctx, 200)
 	if err != nil || level.Meta.Levels == nil || level.Meta.Type != protocol.TypeLevels {
 		t.Fatalf("level: %v %+v", err, level.Meta)
+	}
+}
+
+// A stop must not wait behind the requested chunk length or break the shared session.
+func TestAudioStopInterruptsPendingRead(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	wsURL := startHub(t, ctx)
+	phone := host.NewPhone("interrupt-test")
+	sess, _ := pair(t, ctx, phone, wsURL, serve(t, ctx, phone, wsURL))
+	defer sess.Close()
+	started, err := sess.AudioStart(ctx, 0, 16000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		chunk, err := sess.AudioRead(ctx, started.ListenID, 30000)
+		if err == nil && (!chunk.Meta.Ended || chunk.Meta.DurationMs >= 30000) {
+			err = fmt.Errorf("expected final partial chunk, got %+v", chunk.Meta)
+		}
+		readDone <- err
+	}()
+	// Let the real host begin waiting for the 30-second chunk.
+	time.Sleep(100 * time.Millisecond)
+	stopCtx, stopCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer stopCancel()
+	if _, err := sess.AudioStop(stopCtx, started.ListenID); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := <-readDone; err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if _, err := sess.Cameras(ctx); err != nil {
+		t.Fatalf("connection after stop: %v", err)
 	}
 }
 
