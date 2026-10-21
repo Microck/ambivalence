@@ -44,6 +44,23 @@ final class ForgetAgentTests: XCTestCase {
         XCTAssertEqual(Identity().key, replacement)
     }
 
+    func testAudioStopAllInvalidatesPendingStartupToken() async throws {
+        let audio = Audio()
+        let owner = "conn-1"
+        let token = audio.stopToken(owner: owner)
+        // Simulate agentLeft() / stopAll() running while HubConnection is suspended awaiting
+        // audio.oneShot before Audio.start publishes a recorder.
+        audio.stopAll(owner: owner)
+        XCTAssertNotEqual(audio.stopToken(owner: owner), token)
+
+        do {
+            _ = try await audio.oneShot(owner: owner, durationMs: 1000, sampleRate: 16000, stopToken: token)
+            XCTFail("expected stale stopToken to cancel audio startup")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("cancelled"), "unexpected error: \(error)")
+        }
+    }
+
     @MainActor
     func testForgetAgentRestoresUnlinkedStateAndKeepsHub() async throws {
         let defaults = UserDefaults.standard

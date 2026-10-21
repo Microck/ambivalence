@@ -16,7 +16,9 @@ import java.nio.file.Files
 import java.util.Base64
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Pairs, authenticates and captures through the real Go hub and agent CLI. Opt in with
@@ -75,7 +77,7 @@ class HubClientInteropTest {
         val handleMethod = HubClient::class.java.getDeclaredMethod("handle", String::class.java).apply { isAccessible = true }
         val postMethod = HubClient::class.java.getDeclaredMethod("post", Function0::class.java).apply { isAccessible = true }
         val departuresSeenField = HubClient::class.java.getDeclaredField("departuresSeen").apply { isAccessible = true }
-        val departuresSeen = departuresSeenField.get(client) as java.util.concurrent.atomic.AtomicInteger
+        val departuresSeen = departuresSeenField.get(client) as AtomicInteger
 
         // 1. Enqueue a capture that blocks the inbox thread.
         val capMsg = sealedMsg("cap-1", JSONObject().put("type", "capture"))
@@ -98,6 +100,79 @@ class HubClientInteropTest {
         assertTrue(done.await(5, TimeUnit.SECONDS))
 
         assertEquals("queued listen must not run after departure", 0, camera.listenCalls)
+        client.disconnect()
+    }
+
+    @Test fun listenWaitingOnAudioSemaphoreDoesNotStartAfterDeparture() {
+        val identity = Identity(MemoryPrefs())
+        val key = ByteArray(32) { (it + 1).toByte() }
+        identity.setKey(key)
+        val events = object : HubClient.Events {
+            override fun changed() {}
+            override fun welcomed(client: HubClient) {}
+            override fun dropped(client: HubClient) {}
+            override fun note(text: String) {}
+            override fun confirm(sas: String, answer: CompletableFuture<Boolean>) { answer.complete(true) }
+        }
+        val audioLock = Semaphore(1, true)
+        assertTrue(audioLock.tryAcquire()) // another hub connection currently holds the microphone
+        val enteredListen = CountDownLatch(1)
+        val openedAfterSemaphore = AtomicInteger(0)
+        val camera = object : FakeCamera() {
+            override fun listen(owner: String, durationMs: Int, sampleRate: Int, cancelled: () -> Boolean): Pair<JSONObject, ByteArray> {
+                enteredListen.countDown()
+                return AudioRecorder.withPermit(audioLock, cancelled) {
+                    openedAfterSemaphore.incrementAndGet()
+                    super.listen(owner, durationMs, sampleRate, cancelled)
+                }
+            }
+        }
+        val client = HubClient(listOf("ws://127.0.0.1:1/v1"), identity, camera, events)
+        val nP = ByteArray(16) { 0x11 }
+        val nA = ByteArray(16) { 0x22 }
+        val agentSeal = Seal(key, identity.device, nP, nA)
+        val phoneSeal = Seal(key, identity.device, nP, nA)
+        val dummySocket = java.lang.reflect.Proxy.newProxyInstance(
+            okhttp3.WebSocket::class.java.classLoader,
+            arrayOf(okhttp3.WebSocket::class.java),
+        ) { _, method, _ ->
+            when (method.name) {
+                "send", "close" -> true
+                else -> null
+            }
+        } as okhttp3.WebSocket
+        HubClient::class.java.getDeclaredField("socket").apply { isAccessible = true; set(client, dummySocket) }
+        HubClient::class.java.getDeclaredField("seal").apply { isAccessible = true; set(client, phoneSeal) }
+        HubClient::class.java.getDeclaredField("agentHere").apply { isAccessible = true; set(client, true) }
+
+        fun sealedMsg(id: String, inner: JSONObject): String {
+            val box = agentSeal.rx.seal(inner.put("id", id).toString().toByteArray(Charsets.UTF_8))
+            return JSONObject().put("type", "sealed").put("id", id)
+                .put("box", Base64.getEncoder().encodeToString(box)).toString()
+        }
+
+        val handleMethod = HubClient::class.java.getDeclaredMethod("handle", String::class.java).apply { isAccessible = true }
+        val postMethod = HubClient::class.java.getDeclaredMethod("post", Function0::class.java).apply { isAccessible = true }
+        val departuresSeenField = HubClient::class.java.getDeclaredField("departuresSeen").apply { isAccessible = true }
+        val departuresSeen = departuresSeenField.get(client) as AtomicInteger
+
+        // 1. Start a listen request that passes HubClient's initial check and blocks on audioLock.
+        val listenMsg = sealedMsg("listen-sem-1", JSONObject().put("type", "listen").put("durationMs", 60000))
+        postMethod.invoke(client, { handleMethod.invoke(client, listenMsg) })
+        assertTrue(enteredListen.await(5, TimeUnit.SECONDS))
+
+        // 2. While waiting on the semaphore, the agent departs.
+        departuresSeen.incrementAndGet()
+        val depMsg = JSONObject().put("type", "status").put("connected", false).toString()
+        postMethod.invoke(client, { handleMethod.invoke(client, depMsg) })
+
+        // 3. Release the semaphore; the departed request must abort without opening the microphone.
+        audioLock.release()
+        val done = CountDownLatch(1)
+        postMethod.invoke(client, { done.countDown() })
+        assertTrue(done.await(5, TimeUnit.SECONDS))
+
+        assertEquals("listen waiting on semaphore must not open microphone after departure", 0, openedAfterSemaphore.get())
         client.disconnect()
     }
 
@@ -181,15 +256,15 @@ class HubClientInteropTest {
         override fun capture(quality: Int, maxWidth: Int): Pair<JSONObject, ByteArray> =
             JSONObject().put("facing", "back").put("cameraId", "back").put("torch", false).put("zoom", 1.0).put("width", 4).put("height", 2) to jpeg
 
-        override fun listen(owner: String, durationMs: Int, sampleRate: Int): Pair<JSONObject, ByteArray> {
+        override fun listen(owner: String, durationMs: Int, sampleRate: Int, cancelled: () -> Boolean): Pair<JSONObject, ByteArray> {
             listenCalls++
             return JSONObject().put("mime", "audio/wav").put("durationMs", durationMs).put("sampleRate", sampleRate).put("levels", JSONObject().put("rmsDb", -100).put("peakDb", -100)) to ByteArray(44)
         }
 
-        override fun audioStart(owner: String, maxDurationMs: Int, sampleRate: Int): JSONObject =
+        override fun audioStart(owner: String, maxDurationMs: Int, sampleRate: Int, cancelled: () -> Boolean): JSONObject =
             JSONObject().put("listenId", "fake").put("sampleRate", sampleRate).put("maxDurationMs", maxDurationMs)
 
-        override fun audioRead(owner: String, listenId: String, maxMs: Int): Pair<JSONObject, ByteArray> =
+        override fun audioRead(owner: String, listenId: String, maxMs: Int, cancelled: () -> Boolean): Pair<JSONObject, ByteArray> =
             JSONObject().put("mime", "audio/wav").put("durationMs", 0).put("sampleRate", 16000).put("totalMs", 0).put("ended", true) to ByteArray(44)
 
         override fun audioStop(owner: String, listenId: String?): JSONObject {
@@ -198,7 +273,7 @@ class HubClientInteropTest {
             return JSONObject().put("durationMs", 0).put("totalMs", 0).put("ended", true)
         }
 
-        override fun level(owner: String, durationMs: Int, sampleRate: Int): JSONObject =
+        override fun level(owner: String, durationMs: Int, sampleRate: Int, cancelled: () -> Boolean): JSONObject =
             JSONObject().put("durationMs", durationMs).put("sampleRate", sampleRate).put("levels", JSONObject().put("rmsDb", -100).put("peakDb", -100))
     }
 

@@ -300,28 +300,23 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
     // Audio work blocks the connection's inbox thread until the chunk is full, just like a
     // capture blocks on the camera. The permission is checked per call so a user who revoked
     // it in Settings gets a clear error instead of a silent empty recording.
-    private fun <T> withAudio(work: () -> T): T {
+    private fun <T> withAudio(cancelled: () -> Boolean = { false }, work: () -> T): T {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             fail("microphone permission denied; allow the microphone in Android Settings")
         }
-        if (!audioLock.tryAcquire(30, TimeUnit.SECONDS)) fail("microphone busy")
-        try {
-            return work()
-        } finally {
-            audioLock.release()
-        }
+        return AudioRecorder.withPermit(audioLock, cancelled, work = work)
     }
 
-    override fun listen(owner: String, durationMs: Int, sampleRate: Int): Pair<JSONObject, ByteArray> = withAudio {
-        audio.oneShot(owner, durationMs.coerceIn(100, 60000), sampleRate)
+    override fun listen(owner: String, durationMs: Int, sampleRate: Int, cancelled: () -> Boolean): Pair<JSONObject, ByteArray> = withAudio(cancelled) {
+        audio.oneShot(owner, durationMs.coerceIn(100, 60000), sampleRate, cancelled)
     }
 
-    override fun audioStart(owner: String, maxDurationMs: Int, sampleRate: Int): JSONObject = withAudio {
-        audio.start(owner, maxDurationMs.coerceIn(0, 7200000), sampleRate)
+    override fun audioStart(owner: String, maxDurationMs: Int, sampleRate: Int, cancelled: () -> Boolean): JSONObject = withAudio(cancelled) {
+        audio.start(owner, maxDurationMs.coerceIn(0, 7200000), sampleRate, cancelled)
     }
 
-    override fun audioRead(owner: String, listenId: String, maxMs: Int): Pair<JSONObject, ByteArray> = withAudio {
-        audio.read(owner, listenId, maxMs.coerceIn(100, 30000))
+    override fun audioRead(owner: String, listenId: String, maxMs: Int, cancelled: () -> Boolean): Pair<JSONObject, ByteArray> = withAudio(cancelled) {
+        audio.read(owner, listenId, maxMs.coerceIn(100, 30000), cancelled)
     }
 
     override fun audioStop(owner: String, listenId: String?): JSONObject {
@@ -332,8 +327,8 @@ class MainActivity : AppCompatActivity(), Hubs.Ui, CameraHost {
         return withAudio { audio.stop(owner, listenId) }
     }
 
-    override fun level(owner: String, durationMs: Int, sampleRate: Int): JSONObject = withAudio {
-        audio.level(owner, durationMs.coerceIn(100, 30000), sampleRate)
+    override fun level(owner: String, durationMs: Int, sampleRate: Int, cancelled: () -> Boolean): JSONObject = withAudio(cancelled) {
+        audio.level(owner, durationMs.coerceIn(100, 30000), sampleRate, cancelled)
     }
 
     override fun capture(quality: Int, maxWidth: Int): Pair<JSONObject, ByteArray> = withCamera { f ->

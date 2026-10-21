@@ -9,6 +9,8 @@ import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.log10
 import kotlin.math.max
@@ -27,6 +29,7 @@ class AudioRecorder(private val dir: File) {
 
     private val lock = Any()
     private var session: Session? = null
+    private val stopCounts = HashMap<String, Int>()
 
     private class Session(val id: String, val owner: String, val file: File, val rate: Int, val maxBytes: Long) {
         @Volatile var written = 0L
@@ -40,26 +43,44 @@ class AudioRecorder(private val dir: File) {
         var deletePending = false
     }
 
-    fun start(owner: String, maxDurationMs: Int, sampleRate: Int): JSONObject {
+    fun stopToken(owner: String): Int = synchronized(lock) { stopCounts[owner] ?: 0 }
+
+    fun start(owner: String, maxDurationMs: Int, sampleRate: Int, cancelled: () -> Boolean = { false }): JSONObject {
+        val token = stopToken(owner)
+        if (cancelled()) throw IllegalStateException("audio session cancelled")
         stopLocked() // finishes the old session before taking the lock for the new one
         synchronized(lock) {
+            if (cancelled() || (stopCounts[owner] ?: 0) != token) {
+                throw IllegalStateException("audio session cancelled")
+            }
             val rate = sampleRate.coerceIn(8000, 48000)
             val id = Link.hex(Link.nonce()).take(16)
             val file = File.createTempFile("audio-", ".pcm", dir)
             val min = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            if (min <= 0) throw IllegalStateException("this device cannot record at $rate Hz")
+            if (min <= 0) {
+                file.delete()
+                throw IllegalStateException("this device cannot record at $rate Hz")
+            }
             val rec = AudioRecord(
                 MediaRecorder.AudioSource.MIC, rate, AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT, max(min * 2, rate),
             )
             if (rec.state != AudioRecord.STATE_INITIALIZED) {
                 rec.release()
+                file.delete()
                 throw IllegalStateException("microphone unavailable")
             }
             val s = Session(id, owner, file, rate, max(0, maxDurationMs).toLong() * rate * 2 / 1000)
             s.record = rec
             val out = FileOutputStream(file)
             rec.startRecording()
+            if (cancelled() || (stopCounts[owner] ?: 0) != token) {
+                runCatching { out.close() }
+                runCatching { rec.stop() }
+                rec.release()
+                file.delete()
+                throw IllegalStateException("audio session cancelled")
+            }
             s.thread = Thread {
                 val buf = ShortArray(max(1024, min / 2))
                 try {
@@ -93,12 +114,12 @@ class AudioRecorder(private val dir: File) {
         }
     }
 
-    fun read(owner: String, id: String, maxMs: Int): Pair<JSONObject, ByteArray> =
-        readChunk(owner, id, maxMs.coerceIn(100, 30000))
+    fun read(owner: String, id: String, maxMs: Int, cancelled: () -> Boolean = { false }): Pair<JSONObject, ByteArray> =
+        readChunk(owner, id, maxMs.coerceIn(100, 30000), cancelled)
 
     // chunkMs may exceed the protocol chunk cap for a one-shot clip: there the whole clip is
     // wanted in one reply, and the recorder stops on its own at that length.
-    private fun readChunk(owner: String, id: String, chunkMs: Int): Pair<JSONObject, ByteArray> {
+    private fun readChunk(owner: String, id: String, chunkMs: Int, cancelled: () -> Boolean = { false }): Pair<JSONObject, ByteArray> {
         val s = synchronized(lock) {
             val cur = session ?: throw IllegalStateException("no such audio session")
             if (cur.id != id || cur.owner != owner) throw IllegalStateException("no such audio session")
@@ -109,7 +130,7 @@ class AudioRecorder(private val dir: File) {
             val want = chunkMs.toLong() * s.rate * 2 / 1000
             val deadline = System.currentTimeMillis() + chunkMs + 5000
             while (true) {
-                val ready = synchronized(lock) { s.written - s.readOffset >= want || s.ended }
+                val ready = synchronized(lock) { s.written - s.readOffset >= want || s.ended || cancelled() }
                 if (ready || System.currentTimeMillis() >= deadline) break
                 Thread.sleep(20)
             }
@@ -145,11 +166,11 @@ class AudioRecorder(private val dir: File) {
     }
 
     /** Records one whole clip; the session limit is the clip length. */
-    fun oneShot(owner: String, durationMs: Int, sampleRate: Int): Pair<JSONObject, ByteArray> {
-        val started = start(owner, durationMs, sampleRate)
+    fun oneShot(owner: String, durationMs: Int, sampleRate: Int, cancelled: () -> Boolean = { false }): Pair<JSONObject, ByteArray> {
+        val started = start(owner, durationMs, sampleRate, cancelled)
         val id = started.getString("listenId")
         return try {
-            val (meta, pcm) = readChunk(owner, id, durationMs.coerceIn(100, 60000))
+            val (meta, pcm) = readChunk(owner, id, durationMs.coerceIn(100, 60000), cancelled)
             meta.put("durationMs", durationMs) to pcm
         } finally {
             // Also covers an agent that left mid-clip and pulled the session out from under us.
@@ -158,11 +179,11 @@ class AudioRecorder(private val dir: File) {
     }
 
     /** Measures the same signal a clip would contain, without returning the audio. */
-    fun level(owner: String, durationMs: Int, sampleRate: Int): JSONObject {
-        val started = start(owner, durationMs, sampleRate)
+    fun level(owner: String, durationMs: Int, sampleRate: Int, cancelled: () -> Boolean = { false }): JSONObject {
+        val started = start(owner, durationMs, sampleRate, cancelled)
         val id = started.getString("listenId")
         return try {
-            val (meta, wavBytes) = readChunk(owner, id, durationMs.coerceIn(100, 60000))
+            val (meta, wavBytes) = readChunk(owner, id, durationMs.coerceIn(100, 60000), cancelled)
             val pcm = wavBytes.copyOfRange(44, wavBytes.size)
             JSONObject().put("durationMs", durationMs).put("sampleRate", meta.optInt("sampleRate")).put("levels", levels(pcm))
         } finally {
@@ -177,6 +198,9 @@ class AudioRecorder(private val dir: File) {
      */
     fun stop(owner: String, id: String?): JSONObject {
         val s = synchronized(lock) {
+            if (id == null) {
+                stopCounts[owner] = (stopCounts[owner] ?: 0) + 1
+            }
             val cur = session ?: throw IllegalStateException("no such audio session")
             if (cur.owner != owner || (id != null && cur.id != id)) throw IllegalStateException("no such audio session")
             session = null
@@ -252,5 +276,36 @@ class AudioRecorder(private val dir: File) {
         }
         fun db(x: Double): Double = if (x <= 0) -100.0 else max(-100.0, Math.round(20 * log10(x / 32768.0) * 10) / 10.0)
         return JSONObject().put("rmsDb", db(sqrt(sum / n))).put("peakDb", db(peak.toDouble())).put("clipping", peak >= 32767)
+    }
+
+    companion object {
+        /**
+         * Acquires [lock] for up to [timeoutMs] while polling [cancelled], then runs [work] only
+         * if [cancelled] is still false once the permit is held.
+         */
+        fun <T> withPermit(
+            lock: Semaphore,
+            cancelled: () -> Boolean = { false },
+            timeoutMs: Long = 30_000,
+            work: () -> T,
+        ): T {
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+            var acquired = false
+            while (System.nanoTime() < deadline) {
+                if (cancelled()) throw IllegalStateException("audio session cancelled")
+                val waitNs = (deadline - System.nanoTime()).coerceAtMost(TimeUnit.MILLISECONDS.toNanos(50))
+                if (lock.tryAcquire(waitNs.coerceAtLeast(1), TimeUnit.NANOSECONDS)) {
+                    acquired = true
+                    break
+                }
+            }
+            if (!acquired) throw IllegalStateException("microphone busy")
+            try {
+                if (cancelled()) throw IllegalStateException("audio session cancelled")
+                return work()
+            } finally {
+                lock.release()
+            }
+        }
     }
 }

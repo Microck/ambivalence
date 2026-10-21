@@ -46,18 +46,18 @@ interface CameraHost {
      * One clip, capped by the agent at 60 s. Returns metadata and a WAV file. [owner] is the
      * connection that started it; another connection's session is never touched.
      */
-    fun listen(owner: String, durationMs: Int, sampleRate: Int): Pair<JSONObject, ByteArray>
+    fun listen(owner: String, durationMs: Int, sampleRate: Int, cancelled: () -> Boolean = { false }): Pair<JSONObject, ByteArray>
 
     /** Starts continuous recording; a zero max means until stop. */
-    fun audioStart(owner: String, maxDurationMs: Int, sampleRate: Int): JSONObject
+    fun audioStart(owner: String, maxDurationMs: Int, sampleRate: Int, cancelled: () -> Boolean = { false }): JSONObject
 
     /** Drains audio recorded since the previous call, waiting up to maxMs for it. */
-    fun audioRead(owner: String, listenId: String, maxMs: Int): Pair<JSONObject, ByteArray>
+    fun audioRead(owner: String, listenId: String, maxMs: Int, cancelled: () -> Boolean = { false }): Pair<JSONObject, ByteArray>
 
     /** Stops [owner]'s session with this id, or any session owned by [owner] when null (agent left). */
     fun audioStop(owner: String, listenId: String?): JSONObject
 
-    fun level(owner: String, durationMs: Int, sampleRate: Int): JSONObject
+    fun level(owner: String, durationMs: Int, sampleRate: Int, cancelled: () -> Boolean = { false }): JSONObject
 }
 
 /**
@@ -413,7 +413,8 @@ class HubClient(
 
     // Serves one opened request; every reply goes back sealed under the session it came in on.
     private fun serve(s: Seal, m: JSONObject) {
-        if (agentGone) return
+        val gone = { agentGone || s !== seal }
+        if (gone()) return
         val id = m.optString("id")
         val type = m.optString("type")
         try {
@@ -435,18 +436,18 @@ class HubClient(
                 "listen" -> {
                     val ms = m.optInt("durationMs").takeIf { it > 0 } ?: DEFAULT_AUDIO_MS
                     val rate = m.optInt("sampleRate").takeIf { it > 0 } ?: DEFAULT_SAMPLE_RATE
-                    val (meta, wav) = camera.listen(owner, ms, rate)
+                    val (meta, wav) = camera.listen(owner, ms, rate, gone)
                     meta.put("type", "frame").put("id", id).put("mime", "audio/wav").put("bytes", wav.size)
                     sendSealed(s, meta, wav)
                 }
                 "audio_start" -> {
                     val max = m.optInt("maxDurationMs")
                     val rate = m.optInt("sampleRate").takeIf { it > 0 } ?: DEFAULT_SAMPLE_RATE
-                    sendSealed(s, camera.audioStart(owner, max, rate).put("type", "audio_started").put("id", id))
+                    sendSealed(s, camera.audioStart(owner, max, rate, gone).put("type", "audio_started").put("id", id))
                 }
                 "audio_read" -> {
                     val ms = (m.optInt("durationMs").takeIf { it > 0 } ?: DEFAULT_CHUNK_MS).coerceIn(100, MAX_CHUNK_MS)
-                    val (meta, wav) = camera.audioRead(owner, m.optString("listenId"), ms)
+                    val (meta, wav) = camera.audioRead(owner, m.optString("listenId"), ms, gone)
                     meta.put("type", "frame").put("id", id).put("mime", "audio/wav").put("bytes", wav.size)
                     sendSealed(s, meta, wav)
                 }
@@ -457,7 +458,7 @@ class HubClient(
                 "level" -> {
                     val ms = (m.optInt("durationMs").takeIf { it > 0 } ?: 1000).coerceIn(100, MAX_CHUNK_MS)
                     val rate = m.optInt("sampleRate").takeIf { it > 0 } ?: DEFAULT_SAMPLE_RATE
-                    sendSealed(s, camera.level(owner, ms, rate).put("type", "levels").put("id", id))
+                    sendSealed(s, camera.level(owner, ms, rate, gone).put("type", "levels").put("id", id))
                 }
                 else -> sendSealed(s, JSONObject().put("type", "error").put("id", id).put("error", "unknown request $type"))
             }

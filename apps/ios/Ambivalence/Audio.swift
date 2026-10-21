@@ -16,6 +16,7 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
     /// Called on the main queue when recording starts or stops, for the on-screen indicator.
     var onRecording: ((Bool) -> Void)?
 
+    private let startLock = NSLock()
     private let lock = NSLock()
     private var recorder: AVAudioRecorder?
     private var file: URL?
@@ -28,6 +29,9 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
     /// False while a session is live and its end has not been reported; guards the one-shot
     /// notification so the delegate and a read cannot both fire it.
     private var stopNotified = true
+    /// Bumped whenever [stopAll] (or `stop(owner:id:nil)`) is called for an owner, so an
+    /// asynchronous startup that has not yet published its recorder sees the departure and aborts.
+    private var stopCounts: [String: Int] = [:]
 
     static func capabilities() -> [String: Any] {
         ["version": 1, "mime": "audio/wav", "sampleRate": 16000, "samples": [16000],
@@ -35,10 +39,33 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
          "levels": true]
     }
 
+    /// Snapshot of [owner]'s departure counter, captured on the connection actor before awaiting
+    /// an audio call so a departure during startup cannot open the microphone.
+    func stopToken(owner: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopCounts[owner, default: 0]
+    }
+
+    private func isTokenValid(owner: String, token: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopCounts[owner, default: 0] == token
+    }
+
     /// Starts continuous recording for [owner]. maxDurationMs 0 means until stop.
     @discardableResult
-    func start(owner: String, maxDurationMs: Int, sampleRate: Int) throws -> [String: Any] {
+    func start(owner: String, maxDurationMs: Int, sampleRate: Int, stopToken: Int? = nil) throws -> [String: Any] {
+        startLock.lock()
+        defer { startLock.unlock() }
+        let expectedToken = stopToken ?? self.stopToken(owner: owner)
+        guard isTokenValid(owner: owner, token: expectedToken) else {
+            throw LinkError("audio session cancelled")
+        }
         stopAny() // a new recording preempts whatever session is live, whoever owns it
+        guard isTokenValid(owner: owner, token: expectedToken) else {
+            throw LinkError("audio session cancelled")
+        }
         guard AVAudioApplication.shared.recordPermission == .granted else {
             throw LinkError("microphone permission denied; allow it in Settings")
         }
@@ -64,6 +91,7 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
         }
         guard r.prepareToRecord() else {
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
+            try? FileManager.default.removeItem(at: url)
             throw LinkError("microphone unavailable")
         }
         let started: Bool
@@ -77,9 +105,16 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
             try? FileManager.default.removeItem(at: url)
             throw LinkError("microphone is busy")
         }
-        r.delegate = self
         let id = UUID().uuidString.lowercased().prefix(16)
         lock.lock()
+        if stopCounts[owner, default: 0] != expectedToken {
+            lock.unlock()
+            r.stop()
+            try? session.setActive(false, options: .notifyOthersOnDeactivation)
+            try? FileManager.default.removeItem(at: url)
+            throw LinkError("audio session cancelled")
+        }
+        r.delegate = self
         recorder = r
         file = url
         self.id = String(id)
@@ -157,8 +192,8 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
         return out
     }
 
-    func oneShot(owner: String, durationMs: Int, sampleRate: Int) async throws -> (meta: [String: Any], wav: Data) {
-        let started = try start(owner: owner, maxDurationMs: durationMs, sampleRate: sampleRate)
+    func oneShot(owner: String, durationMs: Int, sampleRate: Int, stopToken: Int? = nil) async throws -> (meta: [String: Any], wav: Data) {
+        let started = try start(owner: owner, maxDurationMs: durationMs, sampleRate: sampleRate, stopToken: stopToken)
         guard let id = started["listenId"] as? String else { throw LinkError("could not start the microphone") }
         do {
             let out = try await readChunk(owner: owner, id: id, chunkMs: min(60000, max(100, durationMs)))
@@ -170,8 +205,8 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
         }
     }
 
-    func level(owner: String, durationMs: Int, sampleRate: Int) async throws -> [String: Any] {
-        let out = try await oneShot(owner: owner, durationMs: durationMs, sampleRate: sampleRate)
+    func level(owner: String, durationMs: Int, sampleRate: Int, stopToken: Int? = nil) async throws -> [String: Any] {
+        let out = try await oneShot(owner: owner, durationMs: durationMs, sampleRate: sampleRate, stopToken: stopToken)
         return ["durationMs": out.meta["durationMs"] ?? durationMs, "sampleRate": out.meta["sampleRate"] ?? 16000,
                 "levels": out.meta["levels"] ?? Self.levels(Data())]
     }
@@ -181,6 +216,9 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
     @discardableResult
     func stop(owner: String, id: String?) throws -> [String: Any] {
         lock.lock()
+        if id == nil {
+            stopCounts[owner, default: 0] += 1
+        }
         guard let r = recorder else {
             lock.unlock()
             throw LinkError("no such audio session")

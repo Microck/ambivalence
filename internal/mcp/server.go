@@ -333,13 +333,6 @@ func (s *Server) cameraCapture(ctx context.Context, _ *mcp.CallToolRequest, args
 }
 
 func (s *Server) audioRecord(ctx context.Context, _ *mcp.CallToolRequest, args audioArgs) (*mcp.CallToolResult, any, error) {
-	sess, err := s.requireAgent(ctx)
-	if err != nil {
-		return errResult(err), nil, nil
-	}
-	// A one-shot clip replaces an open listening session: two sessions on one microphone
-	// would only confuse the agent and keep the indicator lit.
-	s.stopListening(sess)
 	duration := protocol.DefaultAudioMs
 	if args.DurationMs != nil {
 		duration = *args.DurationMs
@@ -347,6 +340,13 @@ func (s *Server) audioRecord(ctx context.Context, _ *mcp.CallToolRequest, args a
 	if duration < 100 || duration > protocol.MaxOneShotAudioMs {
 		return errResult(fmt.Errorf("duration must be between 100 and %d ms", protocol.MaxOneShotAudioMs)), nil, nil
 	}
+	sess, err := s.requireAgent(ctx)
+	if err != nil {
+		return errResult(err), nil, nil
+	}
+	// A one-shot clip replaces an open listening session: two sessions on one microphone
+	// would only confuse the agent and keep the indicator lit.
+	s.stopListening(sess)
 	cctx, cancel := context.WithTimeout(ctx, time.Duration(duration+15_000)*time.Millisecond)
 	defer cancel()
 	fr, err := sess.Listen(cctx, duration, 0)
@@ -357,11 +357,6 @@ func (s *Server) audioRecord(ctx context.Context, _ *mcp.CallToolRequest, args a
 }
 
 func (s *Server) audioListenStart(ctx context.Context, _ *mcp.CallToolRequest, args listenStartArgs) (*mcp.CallToolResult, any, error) {
-	sess, err := s.requireAgent(ctx)
-	if err != nil {
-		return errResult(err), nil, nil
-	}
-	s.stopListening(sess)
 	maxMs := protocol.DefaultSessionMs
 	if args.MaxDurationMs != nil {
 		maxMs = *args.MaxDurationMs
@@ -369,6 +364,11 @@ func (s *Server) audioListenStart(ctx context.Context, _ *mcp.CallToolRequest, a
 	if maxMs < 0 || maxMs > protocol.MaxSessionMs {
 		return errResult(fmt.Errorf("max duration must be between 0 and %d ms", protocol.MaxSessionMs)), nil, nil
 	}
+	sess, err := s.requireAgent(ctx)
+	if err != nil {
+		return errResult(err), nil, nil
+	}
+	s.stopListening(sess)
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	started, err := sess.AudioStart(cctx, maxMs, 0)
@@ -387,6 +387,13 @@ func (s *Server) audioListenStart(ctx context.Context, _ *mcp.CallToolRequest, a
 }
 
 func (s *Server) audioListenNext(ctx context.Context, _ *mcp.CallToolRequest, args listenNextArgs) (*mcp.CallToolResult, any, error) {
+	chunk := protocol.DefaultChunkMs
+	if args.ChunkMs != nil {
+		chunk = *args.ChunkMs
+	}
+	if chunk < 100 || chunk > protocol.MaxChunkMs {
+		return errResult(fmt.Errorf("chunk must be between 100 and %d ms", protocol.MaxChunkMs)), nil, nil
+	}
 	s.mu.Lock()
 	id := s.audioListenID
 	s.mu.Unlock()
@@ -396,13 +403,6 @@ func (s *Server) audioListenNext(ctx context.Context, _ *mcp.CallToolRequest, ar
 	sess, err := s.requireAgent(ctx)
 	if err != nil {
 		return errResult(err), nil, nil
-	}
-	chunk := protocol.DefaultChunkMs
-	if args.ChunkMs != nil {
-		chunk = *args.ChunkMs
-	}
-	if chunk < 100 || chunk > protocol.MaxChunkMs {
-		return errResult(fmt.Errorf("chunk must be between 100 and %d ms", protocol.MaxChunkMs)), nil, nil
 	}
 	// The phone fills the requested chunk in real time, so the call lasts about chunkMs.
 	cctx, cancel := context.WithTimeout(ctx, time.Duration(chunk+20_000)*time.Millisecond)
@@ -445,13 +445,6 @@ func (s *Server) audioListenStop(ctx context.Context, _ *mcp.CallToolRequest, _ 
 }
 
 func (s *Server) audioLevel(ctx context.Context, _ *mcp.CallToolRequest, args levelArgs) (*mcp.CallToolResult, any, error) {
-	sess, err := s.requireAgent(ctx)
-	if err != nil {
-		return errResult(err), nil, nil
-	}
-	// Level uses the one-shot path, which replaces any open session on the phone. Close the
-	// session here first so a later audio_listen_next cannot address a session that is gone.
-	s.stopListening(sess)
 	duration := 1000
 	if args.DurationMs != nil {
 		duration = *args.DurationMs
@@ -459,6 +452,13 @@ func (s *Server) audioLevel(ctx context.Context, _ *mcp.CallToolRequest, args le
 	if duration < 100 || duration > protocol.MaxChunkMs {
 		return errResult(fmt.Errorf("duration must be between 100 and %d ms", protocol.MaxChunkMs)), nil, nil
 	}
+	sess, err := s.requireAgent(ctx)
+	if err != nil {
+		return errResult(err), nil, nil
+	}
+	// Level uses the one-shot path, which replaces any open session on the phone. Close the
+	// session here first so a later audio_listen_next cannot address a session that is gone.
+	s.stopListening(sess)
 	cctx, cancel := context.WithTimeout(ctx, time.Duration(duration+15_000)*time.Millisecond)
 	defer cancel()
 	fr, err := sess.Level(cctx, duration)

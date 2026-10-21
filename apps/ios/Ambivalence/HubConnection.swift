@@ -53,8 +53,7 @@ actor HubConnection {
     }
 
     /// Joins the hub and serves it until the socket ends, then tells the host. A reader reads
-    /// ahead of the serial handler only to notice early that the agent left (or the socket died)
-    /// while a pairing prompt is open; every message is still handled in arrival order.
+    /// ahead of the serial handler only to notice early that the agent left (or the socket died)\n    /// while a pairing prompt is open; every message is still handled in arrival order.
     func run() async {
         guard let (task, first) = await open() else {
             closed = true
@@ -298,6 +297,10 @@ actor HubConnection {
         }
         guard !agentGone else { return }
         let gen = agentGen
+        // Capture the owner's stop token on the actor before any await; if agentLeft() or
+        // socketDied() runs while an async audio call is starting up, Audio.start sees the bumped
+        // counter and aborts before publishing a recorder.
+        let stopToken = audio.stopToken(owner: owner)
         // Anything that fails to open, or whose inner id differs, was forged or replayed by the
         // hub: ignore it and keep serving the real agent.
         guard let box = Data(base64Encoded: m["box"] as? String ?? ""), let plain = try? s.rx.open(box),
@@ -327,14 +330,15 @@ actor HubConnection {
                 let ms = (inner["durationMs"] as? NSNumber)?.intValue ?? 0
                 let rate = (inner["sampleRate"] as? NSNumber)?.intValue ?? 0
                 let out = try await audio.oneShot(owner: owner, durationMs: min(60000, max(100, ms > 0 ? ms : 5000)),
-                                                  sampleRate: rate > 0 ? rate : 16000)
+                                                  sampleRate: rate > 0 ? rate : 16000, stopToken: stopToken)
                 reply = out.meta
                 reply["type"] = "frame"
                 payload = out.wav
             case "audio_start":
                 let cap = (inner["maxDurationMs"] as? NSNumber)?.intValue ?? 0
                 let rate = (inner["sampleRate"] as? NSNumber)?.intValue ?? 0
-                reply = try audio.start(owner: owner, maxDurationMs: min(7200000, Swift.max(0, cap)), sampleRate: rate > 0 ? rate : 16000)
+                reply = try audio.start(owner: owner, maxDurationMs: min(7200000, Swift.max(0, cap)),
+                                        sampleRate: rate > 0 ? rate : 16000, stopToken: stopToken)
                 reply["type"] = "audio_started"
             case "audio_read":
                 let ms = (inner["durationMs"] as? NSNumber)?.intValue ?? 0
@@ -350,7 +354,7 @@ actor HubConnection {
                 let ms = (inner["durationMs"] as? NSNumber)?.intValue ?? 0
                 let rate = (inner["sampleRate"] as? NSNumber)?.intValue ?? 0
                 reply = try await audio.level(owner: owner, durationMs: min(30000, max(100, ms > 0 ? ms : 1000)),
-                                              sampleRate: rate > 0 ? rate : 16000)
+                                              sampleRate: rate > 0 ? rate : 16000, stopToken: stopToken)
                 reply["type"] = "levels"
             default:
                 throw LinkError("unknown request \(inner["type"] as? String ?? "")")
