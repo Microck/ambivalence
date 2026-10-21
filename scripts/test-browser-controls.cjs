@@ -262,13 +262,41 @@ test('disconnect while getUserMedia is awaiting permission stops acquired tracks
   });
   vm.runInContext('let listen = null, listenGen = 0;\n' + html.slice(html.indexOf('  const showRec ='), html.indexOf('  function captureJpeg')), context);
   const startPromise = context.startListening(10000);
-  // Let startListening advance past its initial await haltListening() and call getUserMedia().
-  await new Promise(r => setImmediate(r));
   // Disconnect / departure happens while permission prompt is still open.
   await context.haltListening();
   // User grants permission after disconnect.
   resolveMic(mic);
   await assert.rejects(startPromise, /audio session cancelled/);
   assert.equal(stopped, 1);
+  assert.equal(rec.hidden, true);
+});
+
+test('departure during previous AudioContext.close teardown cancels replacement startListening before getUserMedia', async () => {
+  let resolveClose, opened = 0;
+  const rec = { hidden: false };
+  const oldSession = {
+    halted: false, ended: false,
+    proc: { disconnect() {} }, source: { disconnect() {} }, sink: { disconnect() {} },
+    mic: { getTracks() { return [{ stop() {} }]; } },
+    ctx: { close: () => new Promise(r => { resolveClose = r; }) },
+  };
+  const context = vm.createContext({
+    $: () => rec,
+    toHex: () => 'deadbeef',
+    rand: () => new Uint8Array(8),
+    navigator: { mediaDevices: { getUserMedia: async () => { opened++; throw new Error('must not call getUserMedia'); } } },
+    window: { isSecureContext: true },
+  });
+  vm.runInContext('let listen = null, listenGen = 0;\n' + html.slice(html.indexOf('  const showRec ='), html.indexOf('  function captureJpeg')), context);
+  context.setOld = (s) => { listen = s; };
+  vm.runInContext('function installOld(s) { listen = s; }', context);
+  context.installOld(oldSession);
+  const startPromise = context.startListening(10000);
+  // Agent departs while oldSession.ctx.close() is still pending.
+  const haltPromise = context.haltListening();
+  resolveClose();
+  await haltPromise;
+  await assert.rejects(startPromise, /audio session cancelled/);
+  assert.equal(opened, 0);
   assert.equal(rec.hidden, true);
 });

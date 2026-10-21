@@ -138,8 +138,8 @@
   let ws, stream, cameraSelection = null, facing = "environment", torchOn = false, zoomLevel = 1;
   // One continuous microphone session at a time. Audio is captured as Float32 frames and
   // drained by audio_read, so a slow agent never loses what was recorded meanwhile.
-  // listenGen invalidates an in-flight getUserMedia() if the agent leaves or the socket drops
-  // while the user is still responding to the microphone permission prompt.
+  // listenGen invalidates an in-flight startListening() if the agent leaves or the socket drops
+  // while teardown or the microphone permission prompt is awaiting completion.
   let listen = null, listenGen = 0;
   // Per-agent state, reset when an agent arrives or leaves. seal is set once the agent proved
   // the link; only requests sealed under it may touch the camera.
@@ -312,8 +312,17 @@
   // loading step for no benefit at 16 kHz. Frames stay Float32 until a read resamples them.
   async function startListening(maxDurationMs) {
     if (!navigator.mediaDevices || !window.isSecureContext) throw new Error(audioError);
-    await haltListening();
+    // Capture the generation after synchronous teardown of any previous session: if a disconnect
+    // or departure calls haltListening() while the previous AudioContext.close() or the new
+    // getUserMedia() is awaiting completion, gen !== listenGen aborts before opening the mic.
+    const prev = listen;
+    listen = null;
     const gen = ++listenGen;
+    if (prev) {
+      showRec(false);
+      await haltMic(prev);
+      if (gen !== listenGen) throw new Error("audio session cancelled");
+    }
     const mic = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
     if (gen !== listenGen) {
       mic.getTracks().forEach(t => t.stop());
