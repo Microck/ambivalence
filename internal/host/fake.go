@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -14,12 +15,14 @@ import (
 	"math"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/basicfont"
 	"golang.org/x/image/math/fixed"
 
+	"github.com/Microck/ambivalence/internal/audio"
 	"github.com/Microck/ambivalence/internal/link"
 	"github.com/Microck/ambivalence/internal/peer"
 	"github.com/Microck/ambivalence/internal/protocol"
@@ -63,6 +66,110 @@ type phoneState struct {
 	Key    string `json:"key,omitempty"`
 }
 
+// chunkDuration normalizes an audio_read duration the way the phones do: a missing or negative
+// value is the default chunk, and the protocol cap stands.
+func chunkDuration(ms int) int {
+	if ms <= 0 {
+		ms = protocol.DefaultChunkMs
+	}
+	return min(max(ms, 100), protocol.MaxChunkMs)
+}
+
+// fakeAudio is a live recording session: samples exist from the moment it started, and reads
+// consume them in order so an agent that polls slowly still receives every second.
+type fakeAudio struct {
+	mu        sync.Mutex
+	id        string
+	rate      int
+	started   time.Time
+	stoppedAt time.Time
+	stopCh    chan struct{}
+	maxMs     int
+	read      int64 // samples handed to the agent
+	ended     bool
+}
+
+func newFakeAudio(rate, maxMs int) *fakeAudio {
+	return &fakeAudio{
+		id:      randomHex(8),
+		rate:    rate,
+		started: time.Now(),
+		stopCh:  make(chan struct{}),
+		maxMs:   maxMs,
+	}
+}
+
+func (a *fakeAudio) halt() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.stoppedAt.IsZero() {
+		a.stoppedAt = time.Now()
+		close(a.stopCh)
+	}
+}
+
+func (a *fakeAudio) available() (int64, bool) {
+	a.mu.Lock()
+	stoppedAt := a.stoppedAt
+	a.mu.Unlock()
+	now := time.Now()
+	ended := false
+	if !stoppedAt.IsZero() {
+		now = stoppedAt
+		ended = true
+	}
+	elapsed := now.Sub(a.started).Milliseconds()
+	if a.maxMs > 0 && elapsed >= int64(a.maxMs) {
+		elapsed = int64(a.maxMs)
+		ended = true
+	}
+	return elapsed * int64(a.rate) / 1000, ended
+}
+
+// take returns at most maxMs of contiguous audio after the previous read. totalMs is the
+// session's recorded length so far.
+func (a *fakeAudio) take(maxMs int) (pcm []byte, totalMs int, ended bool) {
+	avail, ended := a.available()
+	want := int64(maxMs) * int64(a.rate) / 1000
+	n := avail - a.read
+	if n < 0 {
+		n = 0
+	}
+	if n > want {
+		n = want
+	}
+	pcm = fakeTonePCM(a.read, n, a.rate)
+	a.read += n
+	if ended && a.read >= avail {
+		a.ended = true
+	}
+	return pcm, int(avail * 1000 / int64(a.rate)), a.ended
+}
+
+// fakeTonePCM is a deterministic two-tone test signal so agents and tests hear something
+// non-silent. It is computed from the absolute sample index, which keeps chunk joins seamless.
+func fakeTonePCM(first, count int64, rate int) []byte {
+	pcm := make([]byte, count*2)
+	for i := int64(0); i < count; i++ {
+		n := first + i
+		t := float64(n) / float64(rate)
+		freq := 440.0
+		if int(t)%2 == 1 {
+			freq = 660
+		}
+		amp := 0.0
+		if math.Mod(t, 1) < 0.6 {
+			amp = 0.25
+		}
+		v := int16(amp * 32767 * math.Sin(2*math.Pi*freq*t))
+		binary.LittleEndian.PutUint16(pcm[i*2:], uint16(v))
+	}
+	return pcm
+}
+
 // LoadPhone restores a fake phone from path (or makes a new one there). An empty path keeps
 // everything in memory.
 func LoadPhone(path, name string) (*Phone, error) {
@@ -95,6 +202,8 @@ func LoadPhone(path, name string) (*Phone, error) {
 // Serve joins one hub and answers the agent there with a labeled test chart. A phone may serve
 // several hubs at once; the hub authorises nothing, every agent is checked here (package link).
 func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string)) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	sess, err := peer.Dial(ctx, peer.DialOptions{
 		Role:   protocol.RoleHost,
 		Device: p.Device,
@@ -129,6 +238,8 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 		"whiteBalanceMode":        []string{"auto", "manual"},
 		"whiteBalanceTemperature": positive,
 		"whiteBalanceGains":       map[string]any{"min": 1, "max": math.MaxFloat64},
+		"audioVersion":            1,
+		"audio":                   protocol.AudioCapabilities(),
 	}
 	cams := []protocol.Camera{{
 		ID: "fake-back", Facing: "back", Torch: true, MinZoom: 1, MaxZoom: 8, Capabilities: capabilities,
@@ -139,13 +250,20 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 	// Per-agent state: reset whenever an agent arrives or leaves. seal is set once the agent has
 	// proven the link; only messages sealed under it may touch the camera.
 	var (
-		seal      *peer.Seal
-		challenge []byte
-		deadline  <-chan time.Time // agent must authenticate or start pairing before this
-		pairing   *link.Party
-		pairNB    []byte
-		pairCmt   []byte
+		currentSeal atomic.Pointer[peer.Seal]
+		activeAudio atomic.Pointer[fakeAudio]
+		challenge   []byte
+		deadline    <-chan time.Time // agent must authenticate or start pairing before this
+		pairing     *link.Party
+		pairNB      []byte
+		pairCmt     []byte
+		listen      *fakeAudio
 	)
+	haltActiveAudio := func(id string) {
+		if a := activeAudio.Load(); a != nil && (id == "" || a.id == id) {
+			a.halt()
+		}
+	}
 	agentHere := false
 	// newAgent runs when an agent arrives or leaves. The hub repeats status (welcome, then a
 	// broadcast), so act only on a change; a second challenge would void the first.
@@ -154,7 +272,10 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 			return
 		}
 		agentHere = present
-		seal, challenge, pairing, deadline = nil, nil, nil, nil
+		haltActiveAudio("")
+		activeAudio.Store(nil)
+		currentSeal.Store(nil)
+		challenge, pairing, deadline = nil, nil, nil
 		if !present {
 			return
 		}
@@ -167,13 +288,41 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 	reject := func() {
 		_ = sess.Send(protocol.Message{Type: protocol.TypeReject})
 		// The hub frees the slot at once, so the next agent's status is a real arrival.
-		agentHere, seal, challenge, pairing, deadline = false, nil, nil, nil, nil
+		haltActiveAudio("")
+		activeAudio.Store(nil)
+		currentSeal.Store(nil)
+		agentHere, challenge, pairing, deadline = false, nil, nil, nil
 	}
+	defer func() {
+		currentSeal.Store(nil)
+		haltActiveAudio("")
+	}()
 	newAgent(sess.Status().Connected)
 
-	// camera serves one opened request; every reply goes back sealed.
-	camera := func(m protocol.Message) {
-		reply := func(r protocol.Message, jpeg []byte) { r.ID = m.ID; _ = sess.SendSealed(seal, r, jpeg) }
+	// camera serves one opened request; every reply goes back sealed. It runs on a single
+	// ordered worker goroutine so an in-flight audio_read can wait for samples while the
+	// main loop still receives and decrypts an incoming audio_stop to wake it immediately.
+	type camReq struct {
+		seal *peer.Seal
+		msg  protocol.Message
+	}
+	camReqs := make(chan camReq, 64)
+	defer close(camReqs)
+
+	camera := func(reqSeal *peer.Seal, m protocol.Message) {
+		if currentSeal.Load() != reqSeal {
+			return
+		}
+		if listen != nil && activeAudio.Load() != listen {
+			listen = nil
+		}
+		reply := func(r protocol.Message, jpeg []byte) {
+			if currentSeal.Load() != reqSeal {
+				return
+			}
+			r.ID = m.ID
+			_ = sess.SendSealed(reqSeal, r, jpeg)
+		}
 		switch m.Type {
 		case protocol.TypeCameras:
 			reply(protocol.Message{Type: protocol.TypeCameras, Cameras: cams, Facing: facing, CameraID: cameraID, Settings: settings, Capabilities: capabilities, Torch: torch, Zoom: zoom,
@@ -239,10 +388,97 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 				return
 			}
 			reply(protocol.Message{Facing: facing, CameraID: cameraID, Settings: settings, Capabilities: capabilities, Torch: torch, Zoom: zoom, Width: width, Height: height}, jpegBytes)
+		case protocol.TypeListen:
+			duration, rate, err := protocol.NormalizeAudio(m.DurationMs, m.SampleRate, protocol.DefaultAudioMs, protocol.MaxOneShotAudioMs)
+			if err != nil {
+				reply(protocol.Message{Type: protocol.TypeError, Err: err.Error()}, nil)
+				return
+			}
+			pcm := fakeTonePCM(0, int64(duration)*int64(rate)/1000, rate)
+			level := audio.Level(pcm)
+			reply(protocol.Message{Mime: protocol.AudioMime, DurationMs: duration, SampleRate: rate, Levels: &level}, audio.EncodeWAV(pcm, rate))
+		case protocol.TypeAudioStart:
+			rate := m.SampleRate
+			if rate == 0 {
+				rate = protocol.DefaultAudioSampleRate
+			}
+			if rate < protocol.MinAudioSampleRate || rate > protocol.MaxAudioSampleRate {
+				reply(protocol.Message{Type: protocol.TypeError, Err: "unsupported sample rate"}, nil)
+				return
+			}
+			if m.MaxDurationMs < 0 || m.MaxDurationMs > protocol.MaxSessionMs {
+				reply(protocol.Message{Type: protocol.TypeError, Err: "invalid max duration"}, nil)
+				return
+			}
+			if listen != nil {
+				listen.halt()
+			}
+			listen = newFakeAudio(rate, m.MaxDurationMs)
+			activeAudio.Store(listen)
+			if currentSeal.Load() != reqSeal {
+				listen.halt()
+				activeAudio.CompareAndSwap(listen, nil)
+				return
+			}
+			reply(protocol.Message{Type: protocol.TypeAudioStarted, ListenID: listen.id, SampleRate: rate, MaxDurationMs: m.MaxDurationMs}, nil)
+		case protocol.TypeAudioRead:
+			if listen == nil || m.ListenID != listen.id {
+				reply(protocol.Message{Type: protocol.TypeError, Err: "no such audio session"}, nil)
+				return
+			}
+			// Normalize like the phones do: a missing or negative duration is the default chunk,
+			// and the chunk cap stands. A negative value would otherwise panic the tone generator.
+			ms := chunkDuration(m.DurationMs)
+			want := int64(ms) * int64(listen.rate) / 1000
+			deadline := time.Now().Add(time.Duration(ms+5000) * time.Millisecond)
+			ticker := time.NewTicker(20 * time.Millisecond)
+			for {
+				avail, ended := listen.available()
+				if avail-listen.read >= want || ended || time.Now().After(deadline) {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					ticker.Stop()
+					return
+				case <-listen.stopCh:
+				case <-ticker.C:
+				}
+			}
+			ticker.Stop()
+			pcm, totalMs, ended := listen.take(ms)
+			level := audio.Level(pcm)
+			reply(protocol.Message{Mime: protocol.AudioMime, DurationMs: int(int64(len(pcm)) * 1000 / int64(listen.rate*2)), SampleRate: listen.rate, TotalMs: totalMs, Ended: ended, Levels: &level}, audio.EncodeWAV(pcm, listen.rate))
+		case protocol.TypeAudioStop:
+			if listen == nil || m.ListenID != listen.id {
+				reply(protocol.Message{Type: protocol.TypeError, Err: "no such audio session"}, nil)
+				return
+			}
+			listen.halt()
+			avail, _ := listen.available()
+			totalMs := int(avail * 1000 / int64(listen.rate))
+			activeAudio.CompareAndSwap(listen, nil)
+			listen = nil
+			reply(protocol.Message{Type: protocol.TypeStatus, Facing: facing, CameraID: cameraID, Settings: settings, Capabilities: capabilities, Torch: torch, Zoom: zoom, DurationMs: totalMs, TotalMs: totalMs, Ended: true, Connected: true}, nil)
+		case protocol.TypeLevel:
+			duration, rate, err := protocol.NormalizeAudio(m.DurationMs, m.SampleRate, 1000, protocol.MaxChunkMs)
+			if err != nil {
+				reply(protocol.Message{Type: protocol.TypeError, Err: err.Error()}, nil)
+				return
+			}
+			pcm := fakeTonePCM(0, int64(duration)*int64(rate)/1000, rate)
+			level := audio.Level(pcm)
+			reply(protocol.Message{Type: protocol.TypeLevels, DurationMs: duration, SampleRate: rate, Levels: &level}, nil)
 		default:
 			reply(protocol.Message{Type: protocol.TypeError, Err: "unknown request " + string(m.Type)}, nil)
 		}
 	}
+
+	go func() {
+		for req := range camReqs {
+			camera(req.seal, req.msg)
+		}
+	}()
 
 	reqs := sess.HostRequests()
 	for {
@@ -250,7 +486,7 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline:
-			if seal == nil && pairing == nil {
+			if currentSeal.Load() == nil && pairing == nil {
 				reject() // silent squatter
 			}
 			deadline = nil
@@ -259,6 +495,7 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 				return fmt.Errorf("host session closed")
 			}
 			m := fr.Meta
+			seal := currentSeal.Load()
 			switch m.Type {
 			case protocol.TypePing:
 				_ = sess.Send(protocol.Message{ID: m.ID, Type: protocol.TypePong})
@@ -274,7 +511,8 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 					reject()
 					continue
 				}
-				seal, challenge = peer.NewSeal(key, p.Device, nP, nA, false), nil
+				currentSeal.Store(peer.NewSeal(key, p.Device, nP, nA, false))
+				challenge = nil
 				_ = sess.Send(protocol.Message{Type: protocol.TypeAuthOK, Nonce: m.Nonce, MAC: link.Hex(link.MAC(key, "phone", []byte(p.Device), nP, nA))})
 			case protocol.TypePair1:
 				pairCmt, _ = link.Unhex(m.Commit)
@@ -300,7 +538,8 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 				}
 				key := link.Key(shared, agentPub, pairing.Pub)
 				p.setKey(key)
-				seal, pairing = peer.NewSeal(key, p.Device, pairNB, nA, false), nil
+				currentSeal.Store(peer.NewSeal(key, p.Device, pairNB, nA, false))
+				pairing = nil
 				_ = sess.Send(protocol.Message{ID: m.ID, Type: protocol.TypePair4, MAC: link.Hex(link.MAC(key, "confirm", []byte(p.Device)))})
 			case protocol.TypeSealed:
 				if seal == nil { // phone just (re)connected: make the agent re-authenticate
@@ -311,7 +550,14 @@ func (p *Phone) Serve(ctx context.Context, hubURL string, ready func(code string
 				if err != nil || inner.ID != m.ID {
 					continue // forged or replayed by the hub: ignore it, keep serving the real agent
 				}
-				camera(inner)
+				if inner.Type == protocol.TypeAudioStop && inner.ListenID != "" {
+					haltActiveAudio(inner.ListenID)
+				}
+				select {
+				case camReqs <- camReq{seal: seal, msg: inner}:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			case protocol.TypeCameras, protocol.TypeCommand, protocol.TypeCapture:
 				// Unsealed camera requests never count, even after auth: a hub could inject them.
 				_ = sess.ReplyError(m.ID, protocol.ErrUnauthenticated)

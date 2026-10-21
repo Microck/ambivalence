@@ -19,6 +19,7 @@ targets:
           - CFBundleURLName: dev.micr.ambivalence
             CFBundleURLSchemes: [ambivalence]
         NSCameraUsageDescription: Ambivalence shares this camera with your coding agent.
+        NSMicrophoneUsageDescription: Ambivalence lets your coding agent listen through this microphone while the app is open.
         NSLocalNetworkUsageDescription: Ambivalence looks for your agent on this Wi-Fi so you never type an address.
         NSBonjourServices: [_ambivalence._tcp]
         NSAppTransportSecurity:

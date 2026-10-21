@@ -21,6 +21,8 @@
   .brand svg { width: 22px; height: 22px; }
   #code { font: 700 44px/1.1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .15em; user-select: all; }
   #hint { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #rec { position: absolute; top: max(16px, env(safe-area-inset-top)); right: 20px; padding: 6px 10px; border-radius: 999px; background: #e33; color: #fff; font: 700 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .08em; }
+  #rec[hidden] { display: none; }
   input, button { font: inherit; color: #fff; background: #000; border: 1px solid #fff; border-radius: 6px; height: 48px; }
   input { width: 100%; padding: 0 12px; font-size: 14px; }
   input::placeholder { color: #fff; }
@@ -45,6 +47,7 @@
     <div id="code">------</div>
     <div id="hint"></div>
   </div>
+  <div id="rec" hidden>● recording</div>
   <div id="confirm" hidden>
     <div>pair with this agent?</div>
     <div>check it shows the same code</div>
@@ -133,9 +136,17 @@
 
   let code = "------";
   let ws, stream, cameraSelection = null, facing = "environment", torchOn = false, zoomLevel = 1;
+  // One continuous microphone session at a time. Audio is captured as Float32 frames and
+  // drained by audio_read, so a slow agent never loses what was recorded meanwhile.
+  // listenGen invalidates an in-flight startListening() if the agent leaves or the socket drops
+  // while teardown or the microphone permission prompt is awaiting completion.
+  let listen = null, listenGen = 0;
   // Per-agent state, reset when an agent arrives or leaves. seal is set once the agent proved
-  // the link; only requests sealed under it may touch the camera.
-  let agentHere = false, seal = null, challenge = null, pairing = null, squatTimer = null;
+  // the link; only requests sealed under it may touch the camera. departuresSeen/Handled count
+  // agent departures on the socket vs in the serial inbox so queued requests never open the mic
+  // after the agent has already left; agentGen bumps on every reset or socket close so an
+  // in-flight auth/pair3 cannot install a seal after the agent or socket went away.
+  let agentHere = false, seal = null, challenge = null, pairing = null, squatTimer = null, departuresSeen = 0, departuresHandled = 0, agentGen = 0;
   // Sealed sends run one at a time so wire order equals sequence order.
   let outbox = Promise.resolve();
 
@@ -144,7 +155,7 @@
   const showCode = (c) => {
     code = c;
     $("code").textContent = c;
-    $("hint").textContent = ident.key ? "linked: just ask your agent to use the camera" : c === "------" ? "" : "first time only, on the agent: ambivalence pair " + c;
+    $("hint").textContent = ident.key ? "linked: just ask your agent to use the camera or microphone" : c === "------" ? "" : "first time only, on the agent: ambivalence pair " + c;
   };
   const setTorch = (on) => { torchOn = on; torchBtn.textContent = on ? "torch on" : "torch off"; };
   showCode(code);
@@ -293,6 +304,173 @@
     }
   }
 
+  const showRec = (on) => { $("rec").hidden = !on; };
+  const audioError = "the microphone needs HTTPS and permission; open the https:// tunnel URL and allow the microphone";
+  // A session can run for hours, but audio nobody drains must not grow without bound. An agent
+  // that has not read for a minute is not listening: end the session, let it drain what is
+  // buffered, and start another. 60 s of Float32 at 48 kHz is about 11 MB.
+  const MAX_UNREAD_MS = 60000;
+  // Tracks acquired microphone/context resources while AudioContext.resume() is pending so
+  // haltListening() can close them immediately if the socket drops or the agent departs.
+  let startingListen = null;
+
+  // A SCRIPTPROCESSOR still works on every mobile browser; AudioWorklet would add a module
+  // loading step for no benefit at 16 kHz. Frames stay Float32 until a read resamples them.
+  async function startListening(maxDurationMs) {
+    if (!navigator.mediaDevices || !window.isSecureContext) throw new Error(audioError);
+    // Capture the generation after synchronous teardown of any previous session: if a disconnect
+    // or departure calls haltListening() while the previous AudioContext.close() or the new
+    // getUserMedia() is awaiting completion, or if a departure is already queued in inbox ahead
+    // of us, abort before opening the mic.
+    const prevPending = startingListen;
+    startingListen = null;
+    const prev = listen;
+    listen = null;
+    const gen = ++listenGen;
+    const gone = () => gen !== listenGen || (typeof departuresSeen === "number" && departuresSeen > departuresHandled);
+    if (gone()) throw new Error("audio session cancelled");
+    if (prevPending) {
+      await haltMic(prevPending);
+      if (gone()) throw new Error("audio session cancelled");
+    }
+    if (prev) {
+      showRec(false);
+      await haltMic(prev);
+      if (gone()) throw new Error("audio session cancelled");
+    }
+    const mic = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    const pending = { mic, ctx: null, source: null, proc: null, sink: null, halted: false, ended: false };
+    startingListen = pending;
+    try {
+      if (gone()) throw new Error("audio session cancelled");
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new Ctx();
+      pending.ctx = ctx;
+      try { await ctx.resume(); } catch {}
+      if (gone() || pending.halted) throw new Error("audio session cancelled");
+      const source = ctx.createMediaStreamSource(mic);
+      const proc = ctx.createScriptProcessor(4096, 1, 1);
+      const sink = ctx.createGain();
+      sink.gain.value = 0; // keep the graph alive without playing the mic back
+      const s = { id: toHex(rand(8)), mic, ctx, source, proc, sink, rate: ctx.sampleRate,
+        chunks: [], frames: 0, read: 0, maxMs: maxDurationMs || 0, ended: false, halted: false,
+        maxUnread: Math.round(ctx.sampleRate * MAX_UNREAD_MS / 1000) };
+      proc.onaudioprocess = (ev) => {
+        if (s.ended) return;
+        const input = ev.inputBuffer.getChannelData(0);
+        s.chunks.push(new Float32Array(input));
+        s.frames += input.length;
+        if (s.maxMs > 0 && s.frames >= s.rate * s.maxMs / 1000) {
+          s.ended = true;
+          setTimeout(() => haltMic(s), 0);
+        } else if (s.frames - s.read > s.maxUnread) {
+          // Nobody is draining the queue: stop recording instead of growing the heap forever.
+          s.ended = true;
+          setTimeout(() => haltMic(s), 0);
+        }
+      };
+      source.connect(proc); proc.connect(sink); sink.connect(ctx.destination);
+      if (startingListen === pending) startingListen = null;
+      listen = s;
+      showRec(true);
+      return s;
+    } catch (e) {
+      if (startingListen === pending) startingListen = null;
+      await haltMic(pending);
+      throw e;
+    }
+  }
+
+  // Stops the hardware but keeps captured chunks readable, so audio_read can drain the tail
+  // of a session that hit its limit.
+  async function haltMic(s) {
+    if (!s || s.halted) return;
+    s.halted = true;
+    s.ended = true; // wake any audio_read waiting for a full chunk
+    try { s.proc?.disconnect(); } catch {}
+    try { s.source?.disconnect(); } catch {}
+    try { s.sink?.disconnect(); } catch {}
+    s.mic?.getTracks().forEach(t => t.stop());
+    try { await s.ctx?.close(); } catch {}
+    if (listen === s) showRec(false);
+  }
+
+  async function haltListening() {
+    listenGen++;
+    const p = startingListen;
+    startingListen = null;
+    const s = listen;
+    listen = null;
+    if (p) await haltMic(p);
+    if (s) {
+      showRec(false);
+      await haltMic(s);
+    }
+    return s;
+  }
+
+  // Removes frames from the front of the queue (they are consumed exactly once).
+  function takeFrames(s, count) {
+    const out = new Float32Array(count);
+    let filled = 0;
+    while (filled < count && s.chunks.length) {
+      const c = s.chunks[0];
+      const n = Math.min(c.length, count - filled);
+      out.set(c.subarray(0, n), filled);
+      if (n === c.length) s.chunks.shift(); else s.chunks[0] = c.subarray(n);
+      filled += n;
+    }
+    s.read += filled;
+    return out.subarray(0, filled);
+  }
+
+  async function readAudio(s, maxMs) {
+    // The session path caps chunks at 30s, but a one-shot clip can ask for up to 60s at once.
+    const cap = Math.min(maxMs, 60000);
+    const want = Math.max(1, Math.floor(s.rate * cap / 1000));
+    const deadline = Date.now() + cap + 5000;
+    while (!s.ended && s.frames - s.read < want && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 50));
+    }
+    const n = Math.min(want, s.frames - s.read);
+    const floats = takeFrames(s, n);
+    return { floats, rate: s.rate, ended: s.ended && s.frames === s.read, totalMs: Math.round(s.frames * 1000 / s.rate) };
+  }
+
+  function pcm16(floats, srcRate, dstRate) {
+    const n = Math.max(0, Math.round(floats.length * dstRate / srcRate));
+    const out = new Int16Array(n);
+    for (let i = 0; i < n; i++) {
+      const x = floats[Math.min(floats.length - 1, Math.floor(i * srcRate / dstRate))] || 0;
+      out[i] = Math.max(-1, Math.min(1, x)) * 32767;
+    }
+    return out;
+  }
+
+  function wavBytes(pcm, rate) {
+    const out = new Uint8Array(44 + pcm.length * 2), v = new DataView(out.buffer);
+    const str = (off, s) => { for (let i = 0; i < s.length; i++) out[off + i] = s.charCodeAt(i); };
+    str(0, "RIFF"); v.setUint32(4, 36 + pcm.length * 2, true); str(8, "WAVE"); str(12, "fmt ");
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    str(36, "data"); v.setUint32(40, pcm.length * 2, true);
+    for (let i = 0; i < pcm.length; i++) v.setInt16(44 + i * 2, pcm[i], true);
+    return out.buffer;
+  }
+
+  function levels(pcm) {
+    if (!pcm.length) return { rmsDb: -100, peakDb: -100, clipping: false };
+    let sum = 0, peak = 0;
+    for (const v of pcm) { sum += v * v; peak = Math.max(peak, Math.abs(v)); }
+    const db = (x) => x <= 0 ? -100 : Math.max(-100, Math.round(20 * Math.log10(x / 32768) * 10) / 10);
+    return { rmsDb: db(Math.sqrt(sum / pcm.length)), peakDb: db(peak), clipping: peak >= 32767 };
+  }
+
+  function encodeAudio(floats, srcRate) {
+    const pcm = pcm16(floats, srcRate, 16000);
+    return { wav: wavBytes(pcm, 16000), level: levels(pcm), durationMs: Math.round(pcm.length * 1000 / 16000) };
+  }
+
   function captureJpeg(quality, maxWidth) {
     if (stream?.getVideoTracks()[0]?.readyState !== "live") return Promise.reject(new Error("camera not ready; select a camera to reopen it"));
     let w = video.videoWidth, h = video.videoHeight;
@@ -310,11 +488,15 @@
   const send = (o) => { o.v = 1; ws.send(JSON.stringify(o)); };
   const side = () => !stream ? "unknown" : facing === "user" ? "front" : facing === "environment" ? "back" : "unknown";
   const state = (id, type) => ({ type, id, facing: side(), cameraId: stream?.getVideoTracks()[0].getSettings().deviceId || "", capabilities: controlCapabilities(stream?.getVideoTracks()[0]), settings: controlSettings(), torch: torchOn, zoom: zoomLevel, connected: true });
+  const agentGone = () => typeof departuresSeen === "number" && departuresSeen > departuresHandled;
+  const activeSeal = (s) => s && s === seal && !s.gone && !agentGone();
 
   // Replies to a sealed request go back sealed; a frame's JPEG follows as its own sealed box.
   function sendSealed(s, obj, buf) {
+    if (!activeSeal(s)) return;
     obj.v = 1;
     outbox = outbox.then(async () => {
+      if (!activeSeal(s)) return;
       ws.send(JSON.stringify({ v: 1, type: "sealed", id: obj.id, box: b64(await sealBox(s.tx, enc.encode(JSON.stringify(obj)))) }));
       if (buf) ws.send(await sealBox(s.tx, new Uint8Array(buf)));
     }).catch(() => {});
@@ -326,48 +508,71 @@
     try {
       switch (m.type) {
         case "welcome": showCode(m.code || code); // fall through
-        case "status": return onPresence(!!m.connected);
+        case "status":
+          if (!m.connected && typeof departuresSeen === "number" && departuresHandled < departuresSeen) departuresHandled++;
+          return onPresence(!!m.connected);
         case "ping": return send({ type: "pong", id: m.id });
         case "auth": {
+          if (agentGone()) return;
+          const gen = agentGen;
           const key = fromHex(ident.key), nP = fromHex(m.nonce), nA = fromHex(m.agentNonce), dev = enc.encode(ident.device);
-          if (!ident.key || !challenge || nA.length !== 16 || !same(nP, challenge) || !same(fromHex(m.mac), await MAC(key, "agent", dev, nP, nA))) return reject();
-          seal = await makeSeal(key, nP, nA); challenge = null; clearTimeout(squatTimer);
-          setStatus("paired, agent can see this camera");
-          return send({ type: "authok", nonce: m.nonce, mac: toHex(await MAC(key, "phone", dev, nP, nA)) });
+          if (!ident.key || !challenge || nA.length !== 16 || !same(nP, challenge) || !same(fromHex(m.mac), await MAC(key, "agent", dev, nP, nA))) return (gen !== agentGen || agentGone()) ? undefined : reject();
+          const nextSeal = await makeSeal(key, nP, nA);
+          const mac = toHex(await MAC(key, "phone", dev, nP, nA));
+          if (gen !== agentGen || agentGone()) return;
+          seal = nextSeal; challenge = null; clearTimeout(squatTimer);
+          setStatus("paired, agent can see this camera and hear this microphone");
+          return send({ type: "authok", nonce: m.nonce, mac });
         }
         case "pair1": {
+          if (agentGone()) return;
+          const gen = agentGen;
           const kp = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
           const pub = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+          if (gen !== agentGen || agentGone()) return;
           pairing = { kp, pub, nB: rand(16), commit: fromHex(m.commit) };
           return send({ type: "pair2", id: m.id, pub: toHex(pub), nonce: toHex(pairing.nB), device: ident.device });
         }
         case "pair3": {
+          if (agentGone()) { pairing = null; return; }
+          const gen = agentGen;
           const p = pairing, aPub = fromHex(m.pub), nA = fromHex(m.nonce);
-          if (!p || nA.length !== 16 || !same(p.commit, await H("commit", aPub, nA))) { send({ type: "error", id: m.id, error: "pairing commitment mismatch" }); return reject(); }
+          if (!p || nA.length !== 16 || !same(p.commit, await H("commit", aPub, nA))) { if (gen === agentGen && !agentGone()) { send({ type: "error", id: m.id, error: "pairing commitment mismatch" }); return reject(); } pairing = null; return; }
           const peer = await crypto.subtle.importKey("raw", aPub, { name: "ECDH", namedCurve: "P-256" }, false, []);
           const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: peer }, p.kp.privateKey, 256));
+          if (gen !== agentGen || agentGone()) { pairing = null; return; }
           const answer = await askConfirm(await SAS(aPub, p.pub, nA, p.nB));
           // The agent already left: no error or reject, which could drop a newer agent whose
           // arrival is still queued behind this handler.
-          if (answer === "gone") { pairing = null; return; }
+          if (answer === "gone" || gen !== agentGen || agentGone()) { pairing = null; return; }
           if (!answer) { send({ type: "error", id: m.id, error: "pairing cancelled on the phone" }); return reject(); }
           const key = await H("key", shared, aPub, p.pub);
+          const nextSeal = await makeSeal(key, p.nB, nA);
+          const mac = toHex(await MAC(key, "confirm", enc.encode(ident.device)));
+          if (gen !== agentGen || agentGone()) { pairing = null; return; }
           ident.key = toHex(key); saveIdent(); showCode(code);
-          seal = await makeSeal(key, p.nB, nA); pairing = null; clearTimeout(squatTimer);
-          setStatus("paired, agent can see this camera");
-          return send({ type: "pair4", id: m.id, mac: toHex(await MAC(key, "confirm", enc.encode(ident.device))) });
+          seal = nextSeal; pairing = null; clearTimeout(squatTimer);
+          setStatus("paired, agent can see this camera and hear this microphone");
+          return send({ type: "pair4", id: m.id, mac });
         }
         case "sealed": {
           if (!seal) return send({ type: "error", id: m.id, error: "agent not authenticated" });
+          if (!activeSeal(seal)) return;
           const s = seal;
           let inner;
           try { inner = JSON.parse(new TextDecoder().decode(await openBox(s.rx, unb64(m.box)))); } catch { return; } // forged or replayed by the hub
-          if (inner.id !== m.id) return;
-          try { await camera(s, inner); } catch (e) { sendSealed(s, { type: "error", id: inner.id, error: e.message || String(e) }); }
+          if (inner.id !== m.id || !activeSeal(s)) return;
+          // Do not await cameraTurn inside inbox: an in-flight audio_read can wait up to 30s,
+          // and an incoming audio_stop must decrypt and wake readAudio
+          // immediately while still running its reply handler in order on cameraTurn.
+          if (inner.type === "audio_stop" && listen && (!inner.listenId || listen.id === inner.listenId)) {
+            void haltMic(listen);
+          }
+          camera(s, inner).catch(e => { if (activeSeal(s)) sendSealed(s, { type: "error", id: inner.id, error: e.message || String(e) }); });
           return;
         }
         // Unsealed camera requests never count, even after auth: a hub could inject them.
-        case "cameras": case "command": case "capture":
+        case "cameras": case "command": case "capture": case "listen": case "audio_start": case "audio_read": case "audio_stop": case "level":
           return send({ type: "error", id: m.id, error: "agent not authenticated" });
       }
     } catch (e) {
@@ -382,12 +587,19 @@
     return next;
   }
   async function serveCamera(s, m) {
+    if (!activeSeal(s)) return;
     switch (m.type) {
       case "cameras": {
         const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput");
         const track = stream && stream.getVideoTracks()[0];
         const torch = !!(track && track.getCapabilities && track.getCapabilities().torch);
+        const audio = { version: 1, mime: "audio/wav", sampleRate: 16000, samples: [16000], maxOneShotMs: 60000,
+          chunkMs: 10000, maxChunkMs: 30000, maxSessionMs: 7200000, levels: true };
+        const caps = controlCapabilities(track);
+        caps.audioVersion = 1;
+        caps.audio = audio;
         return sendSealed(s, { ...state(m.id, "cameras"), host: { name: "web", platform: "web" },
+          capabilities: caps, audioVersion: 1, audio,
           cameras: devs.map(d => ({ id: d.deviceId, label: d.label, facing: "unknown", torch: false, minZoom: 1, maxZoom: 1,
             ...(d.deviceId === track?.getSettings().deviceId ? { facing: side(), torch, minZoom: zoomRange().min, maxZoom: zoomRange().max, capabilities: controlCapabilities(track) } : {}) })) });
       }
@@ -410,6 +622,57 @@
         const buf = await b.arrayBuffer();
         return sendSealed(s, { ...state(m.id, "frame"), mime: "image/jpeg", bytes: buf.byteLength, width: w, height: h }, buf);
       }
+      case "listen": {
+        if (!activeSeal(s)) return;
+        const ms = Math.max(100, Math.min(60000, m.durationMs || 5000));
+        const live = await startListening(ms);
+        try {
+          const got = await readAudio(live, ms);
+          const out = encodeAudio(got.floats, got.rate);
+          return sendSealed(s, { ...state(m.id, "frame"), mime: "audio/wav", bytes: out.wav.byteLength,
+            durationMs: out.durationMs, sampleRate: 16000, totalMs: got.totalMs, ended: true, levels: out.level }, out.wav);
+        } finally {
+          // Even a failed read must not leave the microphone on.
+          await haltListening();
+        }
+      }
+      case "audio_start": {
+        if (!activeSeal(s)) return;
+        const ms = m.maxDurationMs || 0;
+        if (ms < 0 || ms > 7200000) throw new Error("invalid max duration");
+        const live = await startListening(ms);
+        return sendSealed(s, { ...state(m.id, "audio_started"), listenId: live.id, sampleRate: 16000, maxDurationMs: ms });
+      }
+      case "audio_read": {
+        const live = listen;
+        if (!live || live.id !== m.listenId) throw new Error("no such audio session");
+        const ms = Math.max(100, Math.min(30000, m.durationMs || 10000));
+        const got = await readAudio(live, ms);
+        const out = encodeAudio(got.floats, got.rate);
+        return sendSealed(s, { ...state(m.id, "frame"), mime: "audio/wav", bytes: out.wav.byteLength,
+          durationMs: out.durationMs, sampleRate: 16000, totalMs: got.totalMs, ended: got.ended, levels: out.level }, out.wav);
+      }
+      case "audio_stop": {
+        const live = listen;
+        if (!live || live.id !== m.listenId) throw new Error("no such audio session");
+        const totalMs = Math.round(live.frames * 1000 / live.rate);
+        await haltListening();
+        return sendSealed(s, { ...state(m.id, "status"), durationMs: totalMs, totalMs, ended: true });
+      }
+      case "level": {
+        if (!activeSeal(s)) return;
+        const ms = Math.max(100, Math.min(30000, m.durationMs || 1000));
+        const live = await startListening(ms);
+        try {
+          const got = await readAudio(live, ms);
+          const out = encodeAudio(got.floats, got.rate);
+          return sendSealed(s, { ...state(m.id, "levels"), durationMs: ms, sampleRate: 16000,
+            levels: out.level });
+        } finally {
+          // Even a failed read must not leave the microphone on.
+          await haltListening();
+        }
+      }
       default: throw new Error("unknown request " + m.type);
     }
   }
@@ -419,6 +682,9 @@
   // is dropped so it cannot squat the slot.
   function onPresence(present) {
     if (present && agentHere) return;
+    void haltListening();
+    if (seal) seal.gone = true;
+    agentGen++;
     agentHere = present; seal = null; challenge = null; pairing = null; clearTimeout(squatTimer);
     setStatus(present ? "agent connecting" : "connected, waiting for the agent");
     if (!present) return;
@@ -427,6 +693,9 @@
   }
   function reject() {
     send({ type: "reject" });
+    void haltListening();
+    if (seal) seal.gone = true;
+    agentGen++;
     agentHere = false; seal = null; challenge = null; pairing = null; clearTimeout(squatTimer);
     setStatus("refused an agent that could not prove the link");
   }
@@ -445,23 +714,35 @@
     if (ws) try { ws.close(); } catch {}
     setStatus("connecting to " + parsed.host);
     ws = new WebSocket(url);
-    cancelConfirm(); agentHere = false; seal = null; challenge = null; pairing = null;
+    if (seal) seal.gone = true;
+    agentGen++;
+    cancelConfirm(); void haltListening(); agentHere = false; seal = null; challenge = null; pairing = null;
+    departuresSeen = 0; departuresHandled = 0;
     clearTimeout(squatTimer);
     const mine = ws;
     ws.binaryType = "arraybuffer";
     ws.onopen = () => ws === mine && send({ type: "hello", role: "host", device: ident.device, host: { name: "web", platform: "web" } });
     // One message at a time, so sealed sequence checks follow arrival order. "Agent left" is
-    // also seen at once, because the queue may be parked on the pairing prompt.
+    // also seen at once, because the queue may be parked on the pairing prompt or an audio read.
     let inbox = Promise.resolve();
     ws.onmessage = (ev) => {
       if (ws !== mine) return;
-      if (typeof ev.data === "string" && /"type":"(status|welcome)"/.test(ev.data) && !JSON.parse(ev.data).connected) cancelConfirm();
-      inbox = inbox.then(() => { if (ws === mine) return onMessage(ev); });
+      if (typeof ev.data === "string" && /"type"\s*:\s*"(status|welcome)"/.test(ev.data) && !JSON.parse(ev.data).connected) {
+        departuresSeen++;
+        if (seal) seal.gone = true;
+        cancelConfirm();
+        void haltListening();
+      }
+      inbox = inbox.then(() => { if (ws === mine && ws.readyState !== 2 && ws.readyState !== 3) return onMessage(ev); });
     };
     // Stay linked through network drops: redial this socket's URL until a newer connect() replaces it.
     ws.onclose = () => {
       if (ws !== mine) return;
-      cancelConfirm(); agentHere = false; seal = null; challenge = null; pairing = null; clearTimeout(squatTimer);
+      if (seal) seal.gone = true;
+      agentGen++;
+      departuresSeen++;
+      cancelConfirm(); void haltListening(); agentHere = false; seal = null; challenge = null; pairing = null;
+      clearTimeout(squatTimer);
       setStatus("disconnected, reconnecting");
       setTimeout(() => { if (ws === mine) connect(); }, 3000);
     };

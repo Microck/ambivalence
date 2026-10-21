@@ -21,6 +21,7 @@ import (
 
 	"rsc.io/qr"
 
+	"github.com/Microck/ambivalence/internal/audio"
 	"github.com/Microck/ambivalence/internal/config"
 	"github.com/Microck/ambivalence/internal/host"
 	"github.com/Microck/ambivalence/internal/hub"
@@ -56,6 +57,10 @@ func main() {
 		err = cmdPair(args)
 	case "capture":
 		err = cmdCapture(args)
+	case "listen":
+		err = cmdListen(args)
+	case "level":
+		err = cmdLevel(args)
 	case "status":
 		err = cmdStatus(args)
 	case "cameras":
@@ -82,16 +87,18 @@ func main() {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprint(w, `ambivalence: give coding agents a phone camera
+	fmt.Fprint(w, `ambivalence: give coding agents a phone camera and microphone
 
 USAGE
   ambivalence <command> [flags]
 
 COMMANDS
-  hub          run the pairing hub + web camera host
+  hub          run the pairing hub + web host
   mcp          stdio MCP server (starts a hub unless --no-hub)
   pair CODE    connect the CLI as an agent
   capture      grab a JPEG from the paired host
+  listen       record audio (a clip, or stream until Ctrl+C with --duration 0)
+  level        measure microphone loudness in dBFS
   status       print pairing / camera state
   cameras      list cameras on the host
   torch on|off
@@ -234,15 +241,258 @@ func cmdCapture(args []string) error {
 		}
 	}
 	if path == "" || path == "-" {
-		_, err = os.Stdout.Write(fr.JPEG)
+		_, err = os.Stdout.Write(fr.Data)
 		return err
 	}
-	if err := os.WriteFile(path, fr.JPEG, 0o644); err != nil {
+	if err := os.WriteFile(path, fr.Data, 0o644); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "wrote %s %dx%d %d bytes\n", path, fr.Meta.Width, fr.Meta.Height, len(fr.JPEG))
+	fmt.Fprintf(os.Stderr, "wrote %s %dx%d %d bytes\n", path, fr.Meta.Width, fr.Meta.Height, len(fr.Data))
 	fmt.Println(path)
 	return nil
+}
+
+func cmdListen(args []string) error {
+	fs := flag.NewFlagSet("listen", flag.ExitOnError)
+	hubURL := fs.String("hub", config.HubURL(""), "hub websocket URL")
+	code := fs.String("code", "", "pair code (only for the first pairing)")
+	out := fs.String("o", "", "write WAV to this path (default stdout if not a TTY, else recordings/)")
+	duration := fs.Duration("duration", 5*time.Second, "recording length; 0 streams until Ctrl+C")
+	rate := fs.Int("rate", protocol.DefaultAudioSampleRate, "sample rate in Hz")
+	_ = fs.Parse(args)
+	if *duration < 0 {
+		return fmt.Errorf("duration cannot be negative")
+	}
+	if *duration > 0 && *duration < 100*time.Millisecond {
+		return fmt.Errorf("duration must be 0 or at least 100ms")
+	}
+	if *duration > time.Duration(protocol.MaxSessionMs)*time.Millisecond {
+		return fmt.Errorf("duration %s exceeds the %s session limit; start another recording after it", *duration, time.Duration(protocol.MaxSessionMs)*time.Millisecond)
+	}
+	maxMs := int(*duration / time.Millisecond)
+	sess, closer, err := agentSession(*hubURL, *code)
+	if err != nil {
+		return err
+	}
+	defer closer()
+
+	// Short clips travel in one reply. Longer recordings (including --duration 0) pull chunks
+	// so a phone can keep recording for hours without one giant message.
+	if maxMs > 0 && maxMs <= protocol.MaxOneShotAudioMs {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(maxMs+15_000)*time.Millisecond)
+		defer cancel()
+		fr, err := sess.Listen(ctx, maxMs, *rate)
+		if err != nil {
+			return err
+		}
+		path := *out
+		if path == "" {
+			if info, _ := os.Stdout.Stat(); info != nil && info.Mode()&os.ModeCharDevice != 0 {
+				_ = os.MkdirAll("recordings", 0o755)
+				path = filepath.Join("recordings", time.Now().UTC().Format("20060102-150405")+".wav")
+			}
+		}
+		if path == "" || path == "-" {
+			_, err = os.Stdout.Write(fr.Data)
+			return err
+		}
+		if err := os.WriteFile(path, fr.Data, 0o644); err != nil {
+			return err
+		}
+		level := "rms=unknown peak=unknown"
+		if fr.Meta.Levels != nil {
+			level = fmt.Sprintf("rms=%.1fdB peak=%.1fdB", fr.Meta.Levels.RMSDB, fr.Meta.Levels.PeakDB)
+		}
+		fmt.Fprintf(os.Stderr, "wrote %s %.1fs %d Hz %s\n", path, float64(fr.Meta.DurationMs)/1000, fr.Meta.SampleRate, level)
+		fmt.Println(path)
+		return nil
+	}
+
+	return streamAudio(sess, *out, maxMs, *rate)
+}
+
+// audioSession is the subset of peer.Session that streamAudio drives; a fake implementation in
+// tests can simulate Ctrl+C mid-chunk and mid-stream read errors.
+type audioSession interface {
+	AudioStart(ctx context.Context, maxDurationMs, sampleRate int) (protocol.Message, error)
+	AudioRead(ctx context.Context, listenID string, chunkMs int) (peer.Frame, error)
+	AudioStop(ctx context.Context, listenID string) (protocol.Message, error)
+}
+
+// streamAudio records a session, writing each chunk's PCM into one growing WAV file. With
+// duration 0 it runs until Ctrl+C. The header is patched on exit when the destination can seek.
+func streamAudio(sess audioSession, out string, maxMs, rate int) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return streamAudioWithContext(ctx, sess, out, maxMs, rate, protocol.DefaultChunkMs)
+}
+
+func streamAudioWithContext(ctx context.Context, sess audioSession, out string, maxMs, rate, chunkMs int) error {
+	started, err := sess.AudioStart(ctx, maxMs, rate)
+	if err != nil {
+		return err
+	}
+	stopSession := func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = sess.AudioStop(sctx, started.ListenID)
+	}
+	path := out
+	if path == "" {
+		if info, _ := os.Stdout.Stat(); info != nil && info.Mode()&os.ModeCharDevice != 0 {
+			_ = os.MkdirAll("recordings", 0o755)
+			path = filepath.Join("recordings", time.Now().UTC().Format("20060102-150405")+".wav")
+		}
+	}
+	var f *os.File
+	var w io.Writer = os.Stdout
+	var seeker io.WriteSeeker
+	if path != "" && path != "-" {
+		f, err = os.Create(path)
+		if err != nil {
+			stopSession()
+			return err
+		}
+		defer f.Close()
+		w, seeker = f, f
+	} else if info, statErr := os.Stdout.Stat(); statErr == nil && info.Mode().IsRegular() {
+		// A redirected stdout is a real file we can seek back into and patch. A pipe is not:
+		// patching would fail after a successful recording, so leave its header at zero.
+		seeker = os.Stdout
+	}
+	// One effective rate for the header and the summary: the host may correct or omit the rate,
+	// and --rate 0 asks the host to choose.
+	effRate := started.SampleRate
+	if effRate == 0 {
+		effRate = rate
+	}
+	if effRate == 0 {
+		effRate = protocol.DefaultAudioSampleRate
+	}
+	sw := &wavStream{w: w, seeker: seeker, rate: effRate}
+	if err := sw.start(); err != nil {
+		stopSession()
+		return err
+	}
+	// Always patch the WAV header on exit so any chunks already written remain a valid WAV file
+	// even if a later network read fails.
+	defer func() { _ = sw.close() }()
+
+	// The phone stops recording at maxMs on its own; keep draining until it reports ended so a
+	// tail still in flight is not lost to the local clock.
+	deadline := audioDrainDeadline(maxMs, time.Now())
+	for {
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			break
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		// Keep the in-flight RPC decoupled from ctx cancellation so Ctrl+C does not abandon the
+		// phone's current audio_read chunk; instead, wait up to the chunk timeout to write the
+		// current chunk before stopping.
+		rctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+		fr, err := sess.AudioRead(rctx, started.ListenID, chunkMs)
+		cancel()
+		if err != nil {
+			stopSession()
+			if ctx.Err() != nil {
+				break
+			}
+			return err
+		}
+		pcm, err := audio.PCMFromWAV(fr.Data)
+		if err != nil {
+			stopSession()
+			return err
+		}
+		if err := sw.write(pcm); err != nil {
+			stopSession()
+			return err
+		}
+		if fr.Meta.Ended || ctx.Err() != nil {
+			break
+		}
+	}
+	stopSession()
+	if err := sw.close(); err != nil {
+		return err
+	}
+	if path != "" && path != "-" {
+		fmt.Fprintf(os.Stderr, "wrote %s %.1fs %d Hz\n", path, float64(sw.dataBytes)/(float64(effRate)*2), effRate)
+		fmt.Println(path)
+	}
+	return nil
+}
+
+// audioDrainGrace is how long past the requested cap we keep waiting for the phone to report the
+// session ended. The cap is enforced on the phone, so this only bounds a host that never ends.
+const audioDrainGrace = 60 * time.Second
+
+// audioDrainDeadline returns the local backstop for a streaming recording. It sits well past the
+// phone's own cap so the buffered tail is drained, not truncated by the agent's clock. A zero cap
+// (record until interrupted) has no backstop and returns the zero time.
+func audioDrainDeadline(maxMs int, now time.Time) time.Time {
+	if maxMs <= 0 {
+		return time.Time{}
+	}
+	return now.Add(time.Duration(maxMs)*time.Millisecond + audioDrainGrace)
+}
+
+// wavStream writes a canonical header up front and patches its size fields when the output
+// can seek. A pipe gets a zero-length header, which is all a streaming reader can use anyway.
+type wavStream struct {
+	w         io.Writer
+	seeker    io.WriteSeeker
+	rate      int
+	dataBytes int
+}
+
+func (s *wavStream) start() error {
+	_, err := s.w.Write(audio.WAVHeader(0, s.rate))
+	return err
+}
+
+func (s *wavStream) write(pcm []byte) error {
+	n, err := s.w.Write(pcm)
+	s.dataBytes += n
+	return err
+}
+
+func (s *wavStream) close() error {
+	if s.seeker == nil {
+		return nil
+	}
+	if _, err := s.seeker.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	_, err := s.seeker.Write(audio.WAVHeader(s.dataBytes, s.rate))
+	return err
+}
+
+func cmdLevel(args []string) error {
+	fs := flag.NewFlagSet("level", flag.ExitOnError)
+	hubURL := fs.String("hub", config.HubURL(""), "hub websocket URL")
+	code := fs.String("code", "", "pair code (only for the first pairing)")
+	duration := fs.Duration("duration", time.Second, "measurement window")
+	_ = fs.Parse(args)
+	if *duration < 100*time.Millisecond || *duration > protocol.MaxChunkMs*time.Millisecond {
+		return fmt.Errorf("duration must be between 100ms and %s", time.Duration(protocol.MaxChunkMs)*time.Millisecond)
+	}
+	sess, closer, err := agentSession(*hubURL, *code)
+	if err != nil {
+		return err
+	}
+	defer closer()
+	ctx, cancel := context.WithTimeout(context.Background(), *duration+15*time.Second)
+	defer cancel()
+	fr, err := sess.Level(ctx, int(*duration/time.Millisecond))
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(fr.Meta)
 }
 
 func cmdStatus(args []string) error {

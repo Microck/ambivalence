@@ -69,7 +69,7 @@ class Hubs(
         val live = clients.filter { it.live }
         return when {
             clients.isEmpty() -> "looking for your agent on this Wi-Fi"
-            clients.any { it.agent == HubClient.Agent.AUTHED } -> "paired, agent can see this camera"
+            clients.any { it.agent == HubClient.Agent.AUTHED } -> "paired, agent can see this camera and hear this microphone"
             clients.any { it.agent == HubClient.Agent.CONNECTING } -> "agent connecting"
             live.size > 1 -> "connected to ${live.size} hubs, waiting for the agent"
             live.size == 1 -> "connected, waiting for the agent"

@@ -21,12 +21,21 @@ struct ContentView: View {
                     Text(host.status)
                         .font(.system(size: 15))
                         .accessibilityIdentifier("status_text")
+                    if host.recording {
+                        Text("● recording")
+                            .font(.system(size: 12, weight: .bold, design: .monospaced))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 4)
+                            .background(.red)
+                            .clipShape(Capsule())
+                            .accessibilityIdentifier("recording_indicator")
+                    }
                     Text(host.code)
                         .font(.system(size: 44, weight: .bold, design: .monospaced))
                         .kerning(6)
                         .textSelection(.enabled)
                         .accessibilityIdentifier("pair_code")
-                    Text(host.linked ? "linked: just ask your agent to use the camera" : host.code == "------" ? "" : "first time only, on the agent: ambivalence pair \(host.code)")
+                    Text(host.linked ? "linked: just ask your agent to use the camera or microphone" : host.code == "------" ? "" : "first time only, on the agent: ambivalence pair \(host.code)")
                         .font(.system(size: 13, design: .monospaced))
                     if host.linked {
                         Button("forget agent", role: .destructive) { confirmingForget = true }

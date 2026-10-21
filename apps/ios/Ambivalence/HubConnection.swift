@@ -11,10 +11,14 @@ actor HubConnection {
     }
 
     nonisolated let id = UUID()
+    /// This connection's audio ownership token. Only sessions it started are stopped on a
+    /// departure, a socket loss or a reset, so another hub's churn cannot silence its recording.
+    private var owner: String { id.uuidString }
     /// Addresses of one hub, tried in order; a discovered multihomed hub may list several.
     nonisolated let candidates: [URL]
     private let identity: Identity
     private let camera: Camera
+    private let audio: Audio
     private weak var host: CameraHost?
     private var task: URLSessionWebSocketTask?
     private var closed = false
@@ -30,6 +34,7 @@ actor HubConnection {
     private var seal: Seal?
     private var challenge: Data?
     private var pairing: Pairing?
+    private var deviceWork: Task<Void, Never>?
     private var agentGen = 0 // bumps on every reset, so a stale squat timer does nothing
 
     private struct Pairing {
@@ -40,16 +45,16 @@ actor HubConnection {
 
     private static let unauthenticated = "agent not authenticated"
 
-    init(candidates: [URL], identity: Identity, camera: Camera, host: CameraHost) {
+    init(candidates: [URL], identity: Identity, camera: Camera, audio: Audio, host: CameraHost) {
         self.candidates = candidates
         self.identity = identity
         self.camera = camera
+        self.audio = audio
         self.host = host
     }
 
     /// Joins the hub and serves it until the socket ends, then tells the host. A reader reads
-    /// ahead of the serial handler only to notice early that the agent left (or the socket died)
-    /// while a pairing prompt is open; every message is still handled in arrival order.
+    /// ahead of the serial handler only to notice early that the agent left (or the socket died)\n    /// while a pairing prompt is open; every message is still handled in arrival order.
     func run() async {
         guard let (task, first) = await open() else {
             closed = true
@@ -144,15 +149,19 @@ actor HubConnection {
 
     private func agentLeft() {
         departuresSeen += 1
+        // The device worker may be parked in an audio read; stop this connection's microphone
+        // from the reader so an agent departure silences it at once instead of after the chunk.
+        audio.stopAll(owner: owner)
         cancelPrompt()
     }
 
     private func socketDied() {
         socketEnded = true
+        audio.stopAll(owner: owner)
         cancelPrompt()
     }
 
-    /// The agent being handled can no longer complete a pairing.
+    /// The agent being handled can no longer complete a pairing or run queued requests.
     private var agentGone: Bool { closed || socketEnded || departuresSeen > departuresHandled }
 
     private func cancelPrompt() {
@@ -181,6 +190,7 @@ actor HubConnection {
         case "auth":
             auth(m)
         case "pair1":
+            guard !agentGone else { return }
             let p = Pairing(commit: Link.unhex(m["commit"] as? String))
             pairing = p
             send(["type": "pair2", "id": id, "pub": Link.hex(p.party.pub), "nonce": Link.hex(p.nB), "device": identity.device])
@@ -188,7 +198,7 @@ actor HubConnection {
             await pair3(id, m)
         case "sealed":
             await sealed(id, m)
-        case "cameras", "command", "capture":
+        case "cameras", "command", "capture", "listen", "audio_start", "audio_read", "audio_stop", "level":
             // Unsealed camera requests never count, even after auth: a hub could inject them.
             sendError(id, HubConnection.unauthenticated)
         default:
@@ -226,6 +236,7 @@ actor HubConnection {
     }
 
     private func auth(_ m: [String: Any]) {
+        guard !agentGone else { return }
         let nP = Link.unhex(m["nonce"] as? String), nA = Link.unhex(m["agentNonce"] as? String)
         let mac = Link.unhex(m["mac"] as? String), dev = Data(identity.device.utf8)
         guard let key = identity.key, let challenge, nA.count == 16, Link.equal(nP, challenge),
@@ -238,6 +249,10 @@ actor HubConnection {
     }
 
     private func pair3(_ id: String, _ m: [String: Any]) async {
+        guard !agentGone else {
+            pairing = nil
+            return
+        }
         let agentPub = Link.unhex(m["pub"] as? String), nA = Link.unhex(m["nonce"] as? String)
         guard let p = pairing, nA.count == 16, Link.equal(p.commit, Link.H("commit", agentPub, nA)) else {
             sendError(id, "pairing commitment mismatch")
@@ -281,31 +296,88 @@ actor HubConnection {
             // The phone just (re)connected: make the agent re-authenticate.
             return sendError(id, HubConnection.unauthenticated)
         }
+        guard !agentGone else { return }
+        let gen = agentGen
+        // Capture the owner's stop token on the actor before any await; if agentLeft() or
+        // socketDied() runs while an async audio call is starting up, Audio.start sees the bumped
+        // counter and aborts before publishing a recorder.
+        let stopToken = audio.stopToken(owner: owner)
         // Anything that fails to open, or whose inner id differs, was forged or replayed by the
         // hub: ignore it and keep serving the real agent.
         guard let box = Data(base64Encoded: m["box"] as? String ?? ""), let plain = try? s.rx.open(box),
               let inner = (try? JSONSerialization.jsonObject(with: plain)) as? [String: Any],
               inner["id"] as? String ?? "" == id else { return }
+        if inner["type"] as? String == "audio_stop", let listenID = inner["listenId"] as? String {
+            audio.finishReadEarly(owner: owner, id: listenID)
+        }
+        // Authentication stays on the inbox; device work waits only for earlier device work.
+        let previous = deviceWork
+        deviceWork = Task {
+            await previous?.value
+            guard gen == agentGen, !agentGone else { return }
+            await serve(s, id: id, inner: inner, gen: gen, stopToken: stopToken)
+        }
+    }
+
+    private func serve(_ s: Seal, id: String, inner: [String: Any], gen: Int, stopToken: Int) async {
         do {
             var reply: [String: Any]
-            var jpeg: Data?
+            var payload: Data?
             switch inner["type"] as? String ?? "" {
             case "cameras":
                 reply = try await camera.cameras()
+                var caps = reply["capabilities"] as? [String: Any] ?? [:]
+                caps["audioVersion"] = 1
+                caps["audio"] = Audio.capabilities()
+                reply["capabilities"] = caps
+                reply["audioVersion"] = 1
+                reply["audio"] = Audio.capabilities()
             case "command":
                 let cam = (inner["camera"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                 reply = try await camera.command(camera: cam, torchOn: inner["torchOn"] as? Bool,
                                                  zoom: (inner["zoomLevel"] as? NSNumber)?.doubleValue,
- controls: inner["controls"] as? [String: Any])
+                                                 controls: inner["controls"] as? [String: Any])
             case "capture":
                 let q = (inner["quality"] as? NSNumber)?.intValue ?? 0, w = (inner["maxWidth"] as? NSNumber)?.intValue ?? 0
-                (reply, jpeg) = try await camera.capture(quality: q > 0 ? q : 80, maxWidth: w > 0 ? w : 1280)
+                (reply, payload) = try await camera.capture(quality: q > 0 ? q : 80, maxWidth: w > 0 ? w : 1280)
+            case "listen":
+                let ms = (inner["durationMs"] as? NSNumber)?.intValue ?? 0
+                let rate = (inner["sampleRate"] as? NSNumber)?.intValue ?? 0
+                let out = try await audio.oneShot(owner: owner, durationMs: min(60000, max(100, ms > 0 ? ms : 5000)),
+                                                  sampleRate: rate > 0 ? rate : 16000, stopToken: stopToken)
+                reply = out.meta
+                reply["type"] = "frame"
+                payload = out.wav
+            case "audio_start":
+                let cap = (inner["maxDurationMs"] as? NSNumber)?.intValue ?? 0
+                let rate = (inner["sampleRate"] as? NSNumber)?.intValue ?? 0
+                reply = try audio.start(owner: owner, maxDurationMs: min(7200000, Swift.max(0, cap)),
+                                        sampleRate: rate > 0 ? rate : 16000, stopToken: stopToken)
+                reply["type"] = "audio_started"
+            case "audio_read":
+                let ms = (inner["durationMs"] as? NSNumber)?.intValue ?? 0
+                let out = try await audio.read(owner: owner, id: inner["listenId"] as? String ?? "",
+                                               maxMs: min(30000, max(100, ms > 0 ? ms : 10000)))
+                reply = out.meta
+                reply["type"] = "frame"
+                payload = out.wav
+            case "audio_stop":
+                reply = try audio.stop(owner: owner, id: inner["listenId"] as? String ?? "")
+                reply["type"] = "status"
+            case "level":
+                let ms = (inner["durationMs"] as? NSNumber)?.intValue ?? 0
+                let rate = (inner["sampleRate"] as? NSNumber)?.intValue ?? 0
+                reply = try await audio.level(owner: owner, durationMs: min(30000, max(100, ms > 0 ? ms : 1000)),
+                                              sampleRate: rate > 0 ? rate : 16000, stopToken: stopToken)
+                reply["type"] = "levels"
             default:
                 throw LinkError("unknown request \(inner["type"] as? String ?? "")")
             }
+            guard gen == agentGen, !agentGone else { return }
             reply["id"] = id
-            sendSealed(s, reply, jpeg: jpeg)
+            sendSealed(s, reply, payload: payload)
         } catch {
+            guard gen == agentGen, !agentGone else { return }
             sendSealed(s, ["type": "error", "id": id, "error": error.localizedDescription])
         }
     }
@@ -318,6 +390,8 @@ actor HubConnection {
     }
 
     private func resetAgent() {
+        // Privacy: no microphone survives an agent leaving, reconnecting or being replaced.
+        audio.stopAll(owner: owner)
         agentHere = false
         seal = nil
         challenge = nil
@@ -342,15 +416,15 @@ actor HubConnection {
         send(["type": "error", "id": id, "error": err])
     }
 
-    /// Seals a reply and, for a frame, its JPEG as the next box. Nothing suspends between sealing
-    /// and enqueueing, and the socket sends in enqueue order, so sequence order is wire order.
-    private func sendSealed(_ s: Seal, _ obj: [String: Any], jpeg: Data? = nil) {
-        guard !closed else { return }
+    /// Seals a reply and, for a frame, its payload as the next box. Nothing suspends between
+    /// sealing and enqueueing, and the socket sends in enqueue order, so sequence order is wire order.
+    private func sendSealed(_ s: Seal, _ obj: [String: Any], payload: Data? = nil) {
+        guard !closed, !agentGone else { return }
         guard let inner = HubConnection.encode(obj),
               let outer = HubConnection.encode(["type": "sealed", "id": obj["id"] as? String ?? "",
                                                 "box": s.tx.seal(Data(inner.utf8)).base64EncodedString()]) else { return }
         task?.send(.string(outer)) { _ in }
-        if let jpeg { task?.send(.data(s.tx.seal(jpeg))) { _ in } }
+        if let payload { task?.send(.data(s.tx.seal(payload))) { _ in } }
     }
 
     private static func encode(_ obj: [String: Any]) -> String? {

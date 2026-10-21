@@ -2,7 +2,7 @@
 
 JSON text frames on WebSocket path `/v1`.
 
-The hub is an untrusted relay. The first message from each socket is `hello`; after that the hub forwards everything between a phone (host) and its agent. Hubs never see a secret and authorise nothing: any hub on the Wi-Fi can be rogue, so phone and agent authenticate each other end to end and seal all camera traffic. The reference implementation is `internal/link` (with pinned test vectors) and `internal/host/fake.go` (phone side); the Android, iOS and web hosts implement the same construction.
+The hub is an untrusted relay. The first message from each socket is `hello`; after that the hub forwards everything between a phone (host) and its agent. Hubs never see a secret and authorise nothing: any hub on the Wi-Fi can be rogue, so phone and agent authenticate each other end to end and seal all camera and audio traffic. The reference implementation is `internal/link` (with pinned test vectors) and `internal/host/fake.go` (phone side); the Android, iOS and web hosts implement the same construction.
 
 Notation: `H(label, f1, f2, …)` is SHA-256 over `"ambivalence-v1/" + label`, then each field as a 4-byte big-endian length followed by its bytes. `MAC(key, label, …)` is HMAC-SHA256(key, H(label, …)). Byte fields travel as lowercase hex. Nonces are 16 random bytes.
 
@@ -52,15 +52,15 @@ When an agent arrives, a linked phone sends `{"type":"auth","nonce":nP}`. The ag
 
 ## sealed traffic
 
-After auth or pairing, every camera request, reply and frame is sealed:
+After auth or pairing, every camera and audio request, reply and frame is sealed:
 
 ```json
 {"v":1,"type":"sealed","id":"…","box":"<base64>"}
 ```
 
-`sk = H("session", key, device, nP, nA)`. Agent→phone uses AES-256-GCM key `H("seal-agent", sk)` and phone→agent uses `H("seal-phone", sk)`. A box is `seq (8 bytes BE) || ciphertext+tag`, with nonce `4 zero bytes || seq` and `seq` as additional data. Each direction counts from 1, and a receiver accepts only exactly the next `seq`. This blocks replay, dropping, reordering and splicing. A sealed `frame` is followed by one binary WebSocket message holding the sealed JPEG box, the next `seq`. The outer `id` only routes; the inner message must carry the same `id`.
+`sk = H("session", key, device, nP, nA)`. Agent→phone uses AES-256-GCM key `H("seal-agent", sk)` and phone→agent uses `H("seal-phone", sk)`. A box is `seq (8 bytes BE) || ciphertext+tag`, with nonce `4 zero bytes || seq` and `seq` as additional data. Each direction counts from 1, and a receiver accepts only exactly the next `seq`. This blocks replay, dropping, reordering and splicing. A sealed `frame` is followed by one binary WebSocket message holding the sealed payload (jpeg or wav), the next `seq`. The outer `id` only routes; the inner message must carry the same `id`.
 
-Unsealed camera requests are always refused with `agent not authenticated`. The phone also sends that error, unsealed, for a sealed request it cannot open yet (for example right after reconnecting). The agent then waits for a newer auth and retries once. Hub-originated messages (`welcome`, `status`, errors) are unsealed; forging them can only deny service.
+Unsealed camera or audio requests are always refused with `agent not authenticated`. The phone also sends that error, unsealed, for a sealed request it cannot open yet (for example right after reconnecting). The agent then waits for a newer auth and retries once. Hub-originated messages (`welcome`, `status`, errors) are unsealed; forging them can only deny service.
 
 ## browser host trust
 
@@ -76,6 +76,55 @@ When a phone reconnects (app restart, network change) the hub closes its old soc
 {"v":1,"id":"…","type":"capture","quality":80,"maxWidth":1280}
 {"v":1,"id":"…","type":"frame","mime":"image/jpeg","bytes":12345,"width":1280,"height":960,"facing":"back","torch":false,"zoom":1,"cameraId":"back"}
 ```
+
+## audio (inner)
+
+Audio is mono 16-bit PCM in a WAV container, 16 kHz by default (8–48 kHz accepted). A one-shot clip is one reply. Longer listening is a session: the phone records continuously and the agent pulls chunks, so time spent processing a chunk does not lose the audio recorded meanwhile. Every audio reply is a sealed `frame` with `mime: "audio/wav"` and an independent, complete WAV file.
+
+Hosts advertise audio inside the `cameras` reply's `capabilities` (and mirror it at the top level):
+
+```json
+{"capabilities":{"audioVersion":1,"audio":{"version":1,"mime":"audio/wav","sampleRate":16000,"maxOneShotMs":60000,
+ "chunkMs":10000,"maxChunkMs":30000,"maxSessionMs":7200000,"levels":true}}}
+```
+
+One-shot clip:
+
+```json
+{"v":1,"id":"…","type":"listen","durationMs":5000,"sampleRate":16000}
+{"v":1,"id":"…","type":"frame","mime":"audio/wav","bytes":160044,"durationMs":5000,"sampleRate":16000,
+ "levels":{"rmsDb":-12.0,"peakDb":-3.0}}
+```
+
+Continuous session:
+
+```json
+{"v":1,"id":"…","type":"audio_start","maxDurationMs":600000,"sampleRate":16000}
+{"v":1,"id":"…","type":"audio_started","listenId":"a1b2c3d4","sampleRate":16000,"maxDurationMs":600000}
+
+{"v":1,"id":"…","type":"audio_read","listenId":"a1b2c3d4","durationMs":10000}
+{"v":1,"id":"…","type":"frame","mime":"audio/wav","bytes":320044,"durationMs":10000,"sampleRate":16000,
+ "totalMs":10000,"ended":false,"levels":{"rmsDb":-12.0,"peakDb":-3.0,"clipping":false}}
+
+{"v":1,"id":"…","type":"audio_stop","listenId":"a1b2c3d4"}
+{"v":1,"id":"…","type":"status","durationMs":24000,"totalMs":24000,"ended":true}
+```
+
+An authenticated `audio_stop` interrupts a pending `audio_read` for the same session immediately. The read returns the available partial chunk before the stop acknowledgement. Authentication and device operations retain arrival order; a waiting read must not block reception of stop requests.
+
+`audio_read` waits until the requested chunk is full, the session ends, or 5 seconds past the chunk length, then returns what is available. `ended` is true only when the session stopped and no unread audio remains, so a final short chunk still arrives before the end marker. `durationMs` is the returned chunk length; `totalMs` is the session length so far.
+
+Limits: `durationMs` 100–60000 for `listen`, 100–30000 for `audio_read` and `level`; `maxDurationMs` 0–7200000, where 0 records until `audio_stop` or until the phone runs out of space. A new `listen` or `audio_start` replaces an open session. The microphone stops whenever the agent leaves or the socket drops, and while it is open the app shows a recording indicator.
+
+Level-only measurement:
+
+```json
+{"v":1,"id":"…","type":"level","durationMs":1000}
+{"v":1,"id":"…","type":"levels","durationMs":1000,"sampleRate":16000,
+ "levels":{"rmsDb":-40.1,"peakDb":-20.3,"clipping":false}}
+```
+
+Levels are dBFS relative to full scale, floored at -100. `clipping` means a sample reached the int16 limit. `audio_read` levels describe only the returned chunk.
 
 ## command (inner)
 

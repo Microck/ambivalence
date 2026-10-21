@@ -161,9 +161,9 @@ test('invalid hub URLs are reported without throwing or closing the current sock
   for (const value of ['ws://', 'wss://example.test/#fragment', 'ws://example.test/v1#', 'ws://user:pass@example.test/v1']) {
     let status = '', closed = false;
     const context = vm.createContext({ URL, hubEl: { value, blur() {} },
-      ws: { close() { closed = true; } }, setStatus(s) { status = s; },
+      ws: { close() { closed = true; } }, setStatus(s) { status = s; }, haltListening() {},
       WebSocket: class { constructor() { throw new Error('must not open a socket'); } } });
-    vm.runInContext(connectSource, context);
+    vm.runInContext('let agentGen = 0, departuresSeen = 0, departuresHandled = 0, agentHere = false, seal = null, challenge = null, pairing = null, squatTimer = null;\n' + connectSource, context);
     assert.doesNotThrow(() => context.connect(), value);
     assert.match(status, /invalid hub URL/);
     assert.equal(closed, false);
@@ -200,8 +200,8 @@ test('late close from a replaced socket does not reset the current link', () => 
   const context = vm.createContext({ URL, WebSocket: Socket, ws: null,
     hubEl: { value: 'ws://127.0.0.1:17842/v1', blur() {} }, setStatus() {},
     cancelConfirm() { cancelled++; }, agentHere: true, seal: { active: true },
-    clearTimeout() {}, squatTimer: null, challenge: null, pairing: null,
-    setTimeout() {}, send() {}, onMessage() {}, ident: { device: 'fixture' } });
+    clearTimeout() {}, squatTimer: null, challenge: null, pairing: null, agentGen: 0, departuresSeen: 0, departuresHandled: 0,
+    setTimeout() {}, send() {}, onMessage() {}, haltListening() {}, ident: { device: 'fixture' } });
   vm.runInContext(html.slice(html.indexOf('  function connect()'), html.indexOf('  $("connect").onclick')), context);
   context.connect(); context.connect();
   context.agentHere = true; context.seal = {active:true}; cancelled = 0;
@@ -214,10 +214,269 @@ test('replacement socket clears the previous peer authentication state', () => {
   const context = vm.createContext({ URL, WebSocket: class { close() {} },
     ws: {close() {}}, hubEl: {value:'ws://127.0.0.1:17842/v1',blur() {}},
     setStatus() {}, cancelConfirm() {}, clearTimeout() {}, setTimeout() {},
-    agentHere:true, seal:{old:true}, challenge:{old:true}, pairing:{old:true}, squatTimer:123,
-    ident:{device:'fixture'}, send() {}, onMessage() {} });
+    agentHere:true, seal:{old:true}, challenge:{old:true}, pairing:{old:true}, squatTimer:123, agentGen: 0, departuresSeen: 0, departuresHandled: 0,
+    ident:{device:'fixture'}, send() {}, onMessage() {}, haltListening() {} });
   vm.runInContext(html.slice(html.indexOf('  function connect()'),html.indexOf('  $("connect").onclick')),context);
   context.connect();
   assert.equal(context.agentHere,false);
   for(const field of ['seal','challenge','pairing']) assert.equal(context[field],null);
+});
+
+test('agent departure halts listening immediately while inbox is blocked on an audio read', () => {
+  let socket, halted = 0;
+  class Socket {
+    constructor() { socket = this; }
+    close() {}
+  }
+  let unblockInbox;
+  const blocked = new Promise(r => { unblockInbox = r; });
+  const context = vm.createContext({ URL, WebSocket: Socket, ws: null,
+    hubEl: { value: 'ws://127.0.0.1:17842/v1', blur() {} }, setStatus() {},
+    cancelConfirm() {}, clearTimeout() {}, setTimeout() {},
+    agentHere: true, seal: { active: true }, challenge: null, pairing: null, squatTimer: null, agentGen: 0, departuresSeen: 0, departuresHandled: 0,
+    ident: { device: 'fixture' }, send() {},
+    onMessage() { return blocked; },
+    haltListening() { halted++; } });
+  vm.runInContext(html.slice(html.indexOf('  function connect()'), html.indexOf('  $("connect").onclick')), context);
+  context.connect();
+  halted = 0;
+  // First message parks the inbox (simulating an in-flight audio_read).
+  socket.onmessage({ data: '{"type":"sealed"}' });
+  // Agent departure arrives while the inbox is still parked.
+  socket.onmessage({ data: '{"type":"status","connected":false}' });
+  assert.equal(halted, 1);
+  unblockInbox();
+});
+
+test('disconnect while getUserMedia is awaiting permission stops acquired tracks instead of publishing a stale session', async () => {
+  let resolveMic, stopped = 0;
+  const track = { stop() { stopped++; } };
+  const mic = { getTracks() { return [track]; } };
+  const rec = { hidden: true };
+  const context = vm.createContext({
+    $: () => rec,
+    toHex: () => 'deadbeef',
+    rand: () => new Uint8Array(8),
+    navigator: { mediaDevices: { getUserMedia: () => new Promise(r => { resolveMic = r; }) } },
+    window: { isSecureContext: true, AudioContext: class { constructor() { throw new Error('must not create AudioContext'); } } },
+  });
+  vm.runInContext('let listen = null, listenGen = 0;\n' + html.slice(html.indexOf('  const showRec ='), html.indexOf('  function captureJpeg')), context);
+  const startPromise = context.startListening(10000);
+  // Disconnect / departure happens while permission prompt is still open.
+  await context.haltListening();
+  // User grants permission after disconnect.
+  resolveMic(mic);
+  await assert.rejects(startPromise, /audio session cancelled/);
+  assert.equal(stopped, 1);
+  assert.equal(rec.hidden, true);
+});
+
+test('departure during previous AudioContext.close teardown cancels replacement startListening before getUserMedia', async () => {
+  let resolveClose, opened = 0;
+  const rec = { hidden: false };
+  const oldSession = {
+    halted: false, ended: false,
+    proc: { disconnect() {} }, source: { disconnect() {} }, sink: { disconnect() {} },
+    mic: { getTracks() { return [{ stop() {} }]; } },
+    ctx: { close: () => new Promise(r => { resolveClose = r; }) },
+  };
+  const context = vm.createContext({
+    $: () => rec,
+    toHex: () => 'deadbeef',
+    rand: () => new Uint8Array(8),
+    navigator: { mediaDevices: { getUserMedia: async () => { opened++; throw new Error('must not call getUserMedia'); } } },
+    window: { isSecureContext: true },
+  });
+  vm.runInContext('let listen = null, listenGen = 0;\n' + html.slice(html.indexOf('  const showRec ='), html.indexOf('  function captureJpeg')), context);
+  vm.runInContext('function installOld(s) { listen = s; }', context);
+  context.installOld(oldSession);
+  const startPromise = context.startListening(10000);
+  // Agent departs while oldSession.ctx.close() is still pending.
+  const haltPromise = context.haltListening();
+  resolveClose();
+  await haltPromise;
+  await assert.rejects(startPromise, /audio session cancelled/);
+  assert.equal(opened, 0);
+  assert.equal(rec.hidden, true);
+});
+
+test('sealed listen request awaiting openBox when agent departs never opens the microphone', async () => {
+  let socket, resolveOpen, opened = 0;
+  const rec = { hidden: true };
+  class Socket {
+    constructor() { socket = this; }
+    send() {}
+    close() {}
+  }
+  const context = vm.createContext({
+    URL, TextDecoder, Uint8Array,
+    $: () => rec,
+    toHex: () => 'deadbeef',
+    rand: () => new Uint8Array(8),
+    unb64: () => new Uint8Array(24),
+    b64: () => '',
+    openBox: () => new Promise(r => { resolveOpen = r; }),
+    sealBox: async () => new Uint8Array(24),
+    enc: new TextEncoder(),
+    WebSocket: Socket,
+    ws: null, stream: null, facing: 'environment', torchOn: false, zoomLevel: 1, code: '123456',
+    hubEl: { value: 'ws://127.0.0.1:17842/v1', blur() {} },
+    ident: { device: 'fixture', key: '' },
+    setStatus() {}, showCode() {}, cancelConfirm() {}, clearTimeout() {}, setTimeout() {},
+    controlCapabilities: () => ({}), controlSettings: () => ({}),
+    navigator: { mediaDevices: { getUserMedia: async () => { opened++; throw new Error('must not call getUserMedia'); } } },
+    window: { isSecureContext: true },
+  });
+  vm.runInContext(
+    'let listen = null, listenGen = 0, agentHere = false, seal = null, challenge = null, pairing = null, squatTimer = null, departuresSeen = 0, departuresHandled = 0, agentGen = 0, outbox = Promise.resolve();\n' +
+    html.slice(html.indexOf('  const showRec ='), html.indexOf('  $("connect").onclick')),
+    context,
+  );
+  context.connect();
+  vm.runInContext('agentHere = true; seal = { rx: {}, tx: {} };', context);
+  // Sealed listen request arrives and awaits openBox().
+  socket.onmessage({ data: '{"type":"sealed","id":"req-1","box":"AAAA"}' });
+  await new Promise(r => setImmediate(r));
+  // Agent departs while openBox() is still in flight.
+  socket.onmessage({ data: '{"type":"status","connected":false}' });
+  // Decryption finishes after departure.
+  resolveOpen(new TextEncoder().encode('{"type":"listen","id":"req-1","durationMs":60000}'));
+  await new Promise(r => setImmediate(r));
+  await new Promise(r => setImmediate(r));
+  assert.equal(opened, 0);
+  assert.equal(rec.hidden, true);
+});
+
+test('in-flight auth finishing after ws.onclose does not restore a seal or let queued requests open the microphone', async () => {
+  let socket, resolveSeal, opened = 0;
+  const rec = { hidden: true };
+  class Socket {
+    constructor() { socket = this; this.readyState = 1; }
+    send() {}
+    close() { this.readyState = 3; }
+  }
+  const context = vm.createContext({
+    URL, TextDecoder, Uint8Array,
+    $: () => rec,
+    toHex: (u) => Buffer.from(u).toString('hex'),
+    fromHex: (s) => new Uint8Array(Buffer.from(s || '', 'hex')),
+    same: () => true,
+    MAC: async () => new Uint8Array(32),
+    rand: () => new Uint8Array(16),
+    unb64: () => new Uint8Array(24),
+    b64: () => '',
+    makeSeal: () => new Promise(r => { resolveSeal = r; }),
+    openBox: async () => new TextEncoder().encode('{"type":"audio_start","id":"req-1"}'),
+    sealBox: async () => new Uint8Array(24),
+    enc: new TextEncoder(),
+    WebSocket: Socket,
+    ws: null, stream: null, facing: 'environment', torchOn: false, zoomLevel: 1, code: '123456',
+    hubEl: { value: 'ws://127.0.0.1:17842/v1', blur() {} },
+    ident: { device: 'fixture', key: '00'.repeat(32) },
+    setStatus() {}, showCode() {}, cancelConfirm() {}, clearTimeout() {}, setTimeout() {},
+    controlCapabilities: () => ({}), controlSettings: () => ({}),
+    navigator: { mediaDevices: { getUserMedia: async () => { opened++; throw new Error('must not call getUserMedia'); } } },
+    window: { isSecureContext: true },
+  });
+  vm.runInContext(
+    'let listen = null, listenGen = 0, agentHere = false, seal = null, challenge = null, pairing = null, squatTimer = null, departuresSeen = 0, departuresHandled = 0, agentGen = 0, outbox = Promise.resolve();\n' +
+    html.slice(html.indexOf('  const showRec ='), html.indexOf('  $("connect").onclick')),
+    context,
+  );
+  context.connect();
+  vm.runInContext('agentHere = true; challenge = new Uint8Array(16);', context);
+  socket.onmessage({ data: JSON.stringify({ type: 'auth', nonce: '00'.repeat(16), agentNonce: '11'.repeat(16), mac: '22'.repeat(32) }) });
+  socket.onmessage({ data: JSON.stringify({ type: 'sealed', id: 'req-1', box: 'AAAA' }) });
+  await new Promise(r => setImmediate(r));
+  // Socket closes while makeSeal() is still pending.
+  socket.readyState = 3;
+  socket.onclose();
+  resolveSeal({ rx: {}, tx: {} });
+  await new Promise(r => setImmediate(r));
+  await new Promise(r => setImmediate(r));
+  assert.equal(vm.runInContext('seal', context), null);
+  assert.equal(opened, 0);
+});
+
+test('disconnect while AudioContext.resume is pending immediately stops microphone tracks and closes context', async () => {
+  let resolveResume, stopped = 0, closed = 0;
+  const track = { stop() { stopped++; } };
+  const mic = { getTracks() { return [track]; } };
+  const rec = { hidden: true };
+  class FakeAudioContext {
+    constructor() { this.sampleRate = 16000; }
+    resume() { return new Promise(r => { resolveResume = r; }); }
+    close() { closed++; return Promise.resolve(); }
+  }
+  const context = vm.createContext({
+    $: () => rec,
+    toHex: () => 'deadbeef',
+    rand: () => new Uint8Array(8),
+    navigator: { mediaDevices: { getUserMedia: async () => mic } },
+    window: { isSecureContext: true, AudioContext: FakeAudioContext },
+  });
+  vm.runInContext('let listen = null, listenGen = 0;\n' + html.slice(html.indexOf('  const showRec ='), html.indexOf('  function captureJpeg')), context);
+  const startPromise = context.startListening(10000);
+  await new Promise(r => setImmediate(r));
+  // AudioContext.resume() is still pending when disconnect/departure calls haltListening().
+  await context.haltListening();
+  assert.equal(stopped, 1, 'microphone tracks must be stopped even while resume() is pending');
+  assert.equal(closed, 1, 'AudioContext must be closed even while resume() is pending');
+  assert.equal(vm.runInContext('listen', context), null);
+  resolveResume();
+  await assert.rejects(startPromise, /audio session cancelled/);
+  assert.equal(stopped, 1);
+  assert.equal(rec.hidden, true);
+});
+
+// Real channel encryption and the shipped receiver/device queue exercise the timeout boundary.
+test('authenticated stop interrupts a 30-second browser read and preserves reply order', async () => {
+  const replies = [];
+  let stopped = 0;
+  const rec = { hidden: false };
+  const context = vm.createContext({
+    crypto: require('node:crypto').webcrypto, TextEncoder, TextDecoder,
+    Uint8Array, Float32Array, DataView, btoa, atob, setTimeout, clearTimeout,
+    enc: new TextEncoder(), ident: { device: 'fixture' }, $: () => rec,
+    ws: { send(frame) { replies.push(frame); } }, stream: null,
+    facing: 'environment', torchOn: false, zoomLevel: 1,
+    controlCapabilities: () => ({}), controlSettings: () => ({}),
+  });
+  vm.runInContext(
+    html.slice(html.indexOf('  async function H('), html.indexOf('  // Ask the user')) +
+    html.slice(html.indexOf('  const seqBytes ='), html.indexOf('  let code =')) +
+    'let listen = null, listenGen = 0, agentHere = true, seal = null, challenge = null, pairing = null, squatTimer = null, departuresSeen = 0, departuresHandled = 0, agentGen = 0, outbox = Promise.resolve();\n' +
+    html.slice(html.indexOf('  const showRec ='), html.indexOf('  function connect()')),
+    context,
+  );
+  const phone = await context.makeSeal(new Uint8Array(32), new Uint8Array(16), new Uint8Array(16));
+  const agentTx = { k: phone.rx.k, seq: 0n };
+  const live = { id: 'active', rate: 16000, frames: 1600, read: 0,
+    chunks: [new Float32Array(1600)], ended: false, halted: false,
+    mic: { getTracks: () => [{ stop() { stopped++; } }] }, ctx: { close: async () => {} } };
+  context.phone = phone; context.live = live;
+  vm.runInContext('seal = phone; listen = live;', context);
+  async function request(inner) {
+    const box = await context.sealBox(agentTx, new TextEncoder().encode(JSON.stringify(inner)));
+    await context.onMessage({ data: JSON.stringify({ type: 'sealed', id: inner.id, box: Buffer.from(box).toString('base64') }) });
+  }
+  await request({ type: 'audio_read', id: 'read', listenId: 'active', durationMs: 30000 });
+  await new Promise(r => setImmediate(r));
+  assert.equal(replies.length, 0, 'read must still be waiting');
+  await request({ type: 'audio_stop', id: 'stop', listenId: 'active' });
+  await vm.runInContext('cameraTurn', context);
+  await vm.runInContext('outbox', context);
+  assert.equal(stopped, 1);
+  assert.equal(rec.hidden, true);
+  const agentRx = { k: phone.tx.k, seq: 0n };
+  const decoded = [];
+  for (const frame of replies) {
+    const box = typeof frame === 'string' ? Buffer.from(JSON.parse(frame).box, 'base64') : frame;
+    const plain = await context.openBox(agentRx, new Uint8Array(box));
+    if (typeof frame === 'string') decoded.push(JSON.parse(new TextDecoder().decode(plain)));
+  }
+  assert.deepEqual(decoded.map(x => x.id), ['read', 'stop']);
+  assert.equal(decoded[0].durationMs, 100);
+  assert.equal(decoded[0].ended, true);
+  assert.equal(decoded[1].connected, true);
 });

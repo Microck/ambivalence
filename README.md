@@ -18,13 +18,13 @@
 
 ---
 
-`ambivalence` lets your coding agent use your phone as a camera. you pair the phone once. after that the agent takes photos, switches between the front and back camera, zooms and turns on the torch through MCP or the cli, and you don't touch the phone again. on the same wi-fi the phone finds the agent by itself. everything between the phone and the agent is end-to-end encrypted.
+`ambivalence` lets your coding agent use your phone as a camera and microphone. you pair the phone once. after that the agent takes photos, switches between the front and back camera, zooms, turns on the torch, records clips and listens through the microphone while the app is open, through MCP or the cli, and you don't touch the phone again. on the same wi-fi the phone finds the agent by itself. everything between the phone and the agent is end-to-end encrypted.
 
-[protocol](docs/protocol.md) | [npm](https://www.npmjs.com/package/ambivalence) | [releases](https://github.com/Microck/ambivalence/releases) | [demo video](.github/assets/demo.mp4) | [ios build notes](apps/ios/README.md)
+[protocol](docs/protocol.md) | [audio](docs/audio.md) | [npm](https://www.npmjs.com/package/ambivalence) | [releases](https://github.com/Microck/ambivalence/releases) | [demo video](.github/assets/demo.mp4) | [ios build notes](apps/ios/README.md)
 
 ## why
 
-your agent can read your code, but it can't see the board on your desk, the label on a box or the error on another screen. `ambivalence` gives it the phone in your pocket. it sends still photos, not video, because vision models take stills. each photo is one jpeg over a websocket, so it works on slow networks too.
+your agent can read your code, but it can't see the board on your desk, the label on a box or the error on another screen, and it can't hear a fan, a beep or a machine. `ambivalence` gives it the phone in your pocket. it sends still photos, not video, because vision models take stills, and audio as short wav chunks because models handle clips better than a live stream. each photo is one jpeg over a websocket, so it works on slow networks too. audio is recorded on the phone and buffered, so a slow model does not miss what happened between chunks.
 
 after the first pairing there is nothing to do on the phone. open the app and ask the agent. if the app is closed when the agent asks, the agent waits up to 30 seconds for you to open it. the link survives app restarts and network drops.
 
@@ -35,7 +35,7 @@ after the first pairing there is nothing to do on the phone. open the app and as
 | agent side | linux, macos or windows, amd64 or arm64. node 18+ if you install with npm |
 | android | android 8.0 or newer |
 | ios | ios 17 or newer, and an apple developer team to sign the app |
-| browser | any phone browser with camera access, over https |
+| browser | any phone browser with camera and microphone access, over https |
 | optional | [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) for `--tunnel`, [tailscale](https://tailscale.com) for access from anywhere |
 
 ## install
@@ -73,9 +73,9 @@ sha256sum --check --ignore-missing checksums.txt
 
 ### phone
 
-android: install `ambivalence.apk` from the release. allow installs from unknown sources when android asks. the app asks for camera access on first launch.
+android: install `ambivalence.apk` from the release. allow installs from unknown sources when android asks. the app asks for camera and microphone access on first launch. microphone access is only needed for the audio tools; the camera still works if you deny it.
 
-ios: the release has `ambivalence-unsigned.ipa`. sign it with your own team before you install it, as [apps/ios/README.md](apps/ios/README.md) describes. on first launch, allow camera access and local network access. without local network access the app cannot find the agent on your wi-fi.
+ios: the release has `ambivalence-unsigned.ipa`. sign it with your own team before you install it, as [apps/ios/README.md](apps/ios/README.md) describes. on first launch, allow camera, microphone and local network access. without local network access the app cannot find the agent on your wi-fi.
 
 no app: any phone browser works. see [from a browser](#from-a-browser).
 
@@ -139,8 +139,13 @@ the mcp tools are:
 | `camera_configure` | sets focus, shutter/ISO, exposure bias and white balance where supported |
 | `camera_status` | shows whether the phone is linked and online |
 | `camera_disconnect` | closes the current session; the link stays saved |
+| `audio_record` | records a clip up to 60 seconds and returns wav audio |
+| `audio_listen_start` | starts continuous listening; the phone buffers audio |
+| `audio_listen_next` | returns the next chunk, default 10 seconds, up to 30 |
+| `audio_listen_stop` | closes the microphone |
+| `audio_level` | measures rms and peak dbfs without returning audio |
 
-See [lens selection and manual controls](docs/camera-controls.md) for capability discovery, settings and platform limits.
+See [lens selection and manual controls](docs/camera-controls.md) for capability discovery, settings and platform limits, and [listening and recording](docs/audio.md) for audio limits, chunking and privacy.
 
 ### without mcp
 
@@ -155,6 +160,9 @@ ambivalence cameras                       # discover exact lens IDs and capabili
 ambivalence switch front
 ambivalence configure '{"focusMode":"manual","focusPosition":0}'
 ambivalence zoom 2
+ambivalence listen -o clip.wav               # 5 seconds by default
+ambivalence listen --duration 0 -o long.wav  # until Ctrl+C
+ambivalence level --duration 2s
 ```
 
 ## reach the phone from other networks
@@ -224,7 +232,7 @@ with `--no-hub`, the mcp server connects to `ws://127.0.0.1:7842/v1`. set `--hub
 
 ## from a browser
 
-the hub serves a camera page at `/`, so a phone can use its browser instead of the app. browsers only allow the camera on https pages, so open the page through one of the https options above (`--tunnel`, tailscale serve or your own proxy). allow camera access, and pair with the code it shows.
+the hub serves a camera and microphone page at `/`, so a phone can use its browser instead of the app. browsers only allow the camera and microphone on https pages, so open the page through one of the https options above (`--tunnel`, tailscale serve or your own proxy). allow camera and microphone access, and pair with the code it shows. the page shows a red recording badge while the agent is listening.
 
 the browser page has three limits. it cannot find hubs on the wi-fi. it stops when you close the tab, though it reconnects by itself after a network drop while the tab is open. and it runs javascript that the hub serves, so a hub you don't control could read its link key. use the browser page only with a hub you run. the apps don't have this problem.
 
@@ -247,7 +255,7 @@ to unlink, pair again, or delete the `device` and `key` fields from the agent's 
 ```mermaid
 flowchart LR
   agent["agent<br/>ambivalence mcp / cli"] -- websocket --> hub["hub<br/>relay"]
-  phone["phone app<br/>camera"] -- websocket --> hub
+  phone["phone app<br/>camera + mic"] -- websocket --> hub
   agent <-. "end-to-end sealed" .-> phone
 ```
 
@@ -255,7 +263,7 @@ both the agent and the phone open a connection to a hub, so the phone needs no o
 
 pairing runs a p-256 key exchange. both sides show a code derived from that exchange, and the user checks that they match. a hub in the middle that swapped in its own keys would produce different codes. both sides store the resulting link key.
 
-in every later session, the phone and the agent each prove they hold the key. after that, aes-256-gcm encrypts every request, reply and photo, and each message must arrive in exact order. a rogue hub can refuse to relay, but it cannot see photos, send its own requests, replay old ones or swap images.
+in every later session, the phone and the agent each prove they hold the key. after that, aes-256-gcm encrypts every request, reply, photo and audio chunk, and each message must arrive in exact order. a rogue hub can refuse to relay, but it cannot see photos or hear audio, send its own requests, replay old ones or swap images.
 
 the phone connects to its saved hub and to up to 4 hubs it discovers. the agent reaches it through whichever hub the agent uses.
 

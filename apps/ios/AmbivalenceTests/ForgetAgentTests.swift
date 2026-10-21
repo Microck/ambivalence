@@ -44,6 +44,74 @@ final class ForgetAgentTests: XCTestCase {
         XCTAssertEqual(Identity().key, replacement)
     }
 
+    func testAudioStopAllInvalidatesPendingStartupToken() async throws {
+        let audio = Audio()
+        let owner = "conn-1"
+        let token = audio.stopToken(owner: owner)
+        // Simulate agentLeft() / stopAll() running while HubConnection is suspended awaiting
+        // audio.oneShot before Audio.start publishes a recorder.
+        audio.stopAll(owner: owner)
+        XCTAssertNotEqual(audio.stopToken(owner: owner), token)
+
+        do {
+            _ = try await audio.oneShot(owner: owner, durationMs: 1000, sampleRate: 16000, stopToken: token)
+            XCTFail("expected stale stopToken to cancel audio startup")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("cancelled"), "unexpected error: \(error)")
+        }
+    }
+
+    @MainActor
+    func testStaleAudioCleanupDoesNotDeactivateNewerSessionGeneration() async throws {
+        let audio = Audio()
+        var events: [Bool] = []
+        audio.onRecording = { events.append($0) }
+
+        let oldGen = audio.bumpSessionGenForTesting()
+        let newGen = audio.bumpSessionGenForTesting()
+
+        // Cleanup from oldGen arriving after newGen started must be ignored.
+        audio.audioFinished(gen: oldGen)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(events, [])
+
+        // Cleanup for the current generation still fires.
+        audio.audioFinished(gen: newGen)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(events, [false])
+    }
+
+    func testAlignedPCMChunkReadsDoNotSplitSamplesAtOddRates() throws {
+        // At 11,025 Hz, 100 ms raw formula is 2,205 bytes (odd); chunkByteCount must align to 2,204.
+        let want = Audio.chunkByteCount(chunkMs: 100, rate: 11025)
+        XCTAssertEqual(want, 2204)
+        XCTAssertEqual(want % 2, 0)
+
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("test-aligned-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        var pcm = Data(capacity: 2205 * 2)
+        for _ in 0..<2205 {
+            var sample = Int16(16384).littleEndian
+            withUnsafeBytes(of: &sample) { pcm.append(contentsOf: $0) }
+        }
+        try Audio.wav(pcm, rate: 11025).write(to: url)
+
+        var offset: UInt64 = 45 // even if misaligned, readAlignedPCM snaps to the 2-byte boundary from origin 44
+        let first = try Audio.readAlignedPCM(from: url, origin: 44, readOffset: &offset, want: 2205)
+        XCTAssertEqual(first.pcm.count, 2204)
+        XCTAssertEqual(offset, 44 + 2204)
+
+        let second = try Audio.readAlignedPCM(from: url, origin: 44, readOffset: &offset, want: 2205)
+        XCTAssertEqual(second.pcm.count, 2204)
+        XCTAssertEqual(offset, 44 + 4408)
+
+        let levels1 = Audio.levels(first.pcm)
+        let levels2 = Audio.levels(second.pcm)
+        XCTAssertEqual(levels1["peakDb"] as? Double, -6.0)
+        XCTAssertEqual(levels2["peakDb"] as? Double, -6.0)
+    }
+
     @MainActor
     func testForgetAgentRestoresUnlinkedStateAndKeepsHub() async throws {
         let defaults = UserDefaults.standard
