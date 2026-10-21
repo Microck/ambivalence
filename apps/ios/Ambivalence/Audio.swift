@@ -96,6 +96,12 @@ final class Audio: @unchecked Sendable {
             if s.available >= want || s.ended || Date() >= deadline { break }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
+        return try drain(id: id, want: want)
+    }
+
+    // The file read and the readOffset update stay out of the async path, so the NSLock is
+    // never taken from an async context.
+    private func drain(id: String, want: UInt64) throws -> (meta: [String: Any], wav: Data) {
         lock.lock()
         defer { lock.unlock() }
         guard let r = recorder, self.id == id, let url = file else { throw LinkError("no such audio session") }

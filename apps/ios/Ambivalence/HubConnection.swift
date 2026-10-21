@@ -317,9 +317,9 @@ actor HubConnection {
                 reply["type"] = "frame"
                 payload = out.wav
             case "audio_start":
-                let max = (inner["maxDurationMs"] as? NSNumber)?.intValue ?? 0
+                let cap = (inner["maxDurationMs"] as? NSNumber)?.intValue ?? 0
                 let rate = (inner["sampleRate"] as? NSNumber)?.intValue ?? 0
-                reply = try audio.start(maxDurationMs: min(7200000, max(0, max)), sampleRate: rate > 0 ? rate : 16000)
+                reply = try audio.start(maxDurationMs: min(7200000, Swift.max(0, cap)), sampleRate: rate > 0 ? rate : 16000)
                 reply["type"] = "audio_started"
             case "audio_read":
                 let ms = (inner["durationMs"] as? NSNumber)?.intValue ?? 0
