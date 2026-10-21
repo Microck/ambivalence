@@ -308,11 +308,23 @@ func cmdListen(args []string) error {
 	return streamAudio(sess, *out, maxMs, *rate)
 }
 
+// audioSession is the subset of peer.Session that streamAudio drives; a fake implementation in
+// tests can simulate Ctrl+C mid-chunk and mid-stream read errors.
+type audioSession interface {
+	AudioStart(ctx context.Context, maxDurationMs, sampleRate int) (protocol.Message, error)
+	AudioRead(ctx context.Context, listenID string, chunkMs int) (peer.Frame, error)
+	AudioStop(ctx context.Context, listenID string) (protocol.Message, error)
+}
+
 // streamAudio records a session, writing each chunk's PCM into one growing WAV file. With
 // duration 0 it runs until Ctrl+C. The header is patched on exit when the destination can seek.
-func streamAudio(sess *peer.Session, out string, maxMs, rate int) error {
+func streamAudio(sess audioSession, out string, maxMs, rate int) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	return streamAudioWithContext(ctx, sess, out, maxMs, rate, protocol.DefaultChunkMs)
+}
+
+func streamAudioWithContext(ctx context.Context, sess audioSession, out string, maxMs, rate, chunkMs int) error {
 	started, err := sess.AudioStart(ctx, maxMs, rate)
 	if err != nil {
 		return err
@@ -359,6 +371,10 @@ func streamAudio(sess *peer.Session, out string, maxMs, rate int) error {
 		stopSession()
 		return err
 	}
+	// Always patch the WAV header on exit so any chunks already written remain a valid WAV file
+	// even if a later network read fails.
+	defer func() { _ = sw.close() }()
+
 	// The phone stops recording at maxMs on its own; keep draining until it reports ended so a
 	// tail still in flight is not lost to the local clock.
 	deadline := audioDrainDeadline(maxMs, time.Now())
@@ -366,8 +382,14 @@ func streamAudio(sess *peer.Session, out string, maxMs, rate int) error {
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			break
 		}
-		rctx, cancel := context.WithTimeout(ctx, 40*time.Second)
-		fr, err := sess.AudioRead(rctx, started.ListenID, protocol.DefaultChunkMs)
+		if ctx.Err() != nil {
+			break
+		}
+		// Keep the in-flight RPC decoupled from ctx cancellation so Ctrl+C does not abandon the
+		// phone's current audio_read chunk; instead, wait up to the chunk timeout to write the
+		// current chunk before stopping.
+		rctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+		fr, err := sess.AudioRead(rctx, started.ListenID, chunkMs)
 		cancel()
 		if err != nil {
 			stopSession()
@@ -385,7 +407,7 @@ func streamAudio(sess *peer.Session, out string, maxMs, rate int) error {
 			stopSession()
 			return err
 		}
-		if fr.Meta.Ended {
+		if fr.Meta.Ended || ctx.Err() != nil {
 			break
 		}
 	}

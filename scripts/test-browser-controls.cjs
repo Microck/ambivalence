@@ -221,3 +221,29 @@ test('replacement socket clears the previous peer authentication state', () => {
   assert.equal(context.agentHere,false);
   for(const field of ['seal','challenge','pairing']) assert.equal(context[field],null);
 });
+
+test('agent departure halts listening immediately while inbox is blocked on an audio read', () => {
+  let socket, halted = 0;
+  class Socket {
+    constructor() { socket = this; }
+    close() {}
+  }
+  let unblockInbox;
+  const blocked = new Promise(r => { unblockInbox = r; });
+  const context = vm.createContext({ URL, WebSocket: Socket, ws: null,
+    hubEl: { value: 'ws://127.0.0.1:17842/v1', blur() {} }, setStatus() {},
+    cancelConfirm() {}, clearTimeout() {}, setTimeout() {},
+    agentHere: true, seal: { active: true }, challenge: null, pairing: null, squatTimer: null,
+    ident: { device: 'fixture' }, send() {},
+    onMessage() { return blocked; },
+    haltListening() { halted++; } });
+  vm.runInContext(html.slice(html.indexOf('  function connect()'), html.indexOf('  $("connect").onclick')), context);
+  context.connect();
+  halted = 0;
+  // First message parks the inbox (simulating an in-flight audio_read).
+  socket.onmessage({ data: '{"type":"sealed"}' });
+  // Agent departure arrives while the inbox is still parked.
+  socket.onmessage({ data: '{"type":"status","connected":false}' });
+  assert.equal(halted, 1);
+  unblockInbox();
+});

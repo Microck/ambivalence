@@ -358,8 +358,11 @@
 
   async function haltListening() {
     const s = listen;
-    if (s) await haltMic(s);
     listen = null;
+    if (s) {
+      showRec(false);
+      await haltMic(s);
+    }
     return s;
   }
 
@@ -639,11 +642,14 @@
     ws.binaryType = "arraybuffer";
     ws.onopen = () => ws === mine && send({ type: "hello", role: "host", device: ident.device, host: { name: "web", platform: "web" } });
     // One message at a time, so sealed sequence checks follow arrival order. "Agent left" is
-    // also seen at once, because the queue may be parked on the pairing prompt.
+    // also seen at once, because the queue may be parked on the pairing prompt or an audio read.
     let inbox = Promise.resolve();
     ws.onmessage = (ev) => {
       if (ws !== mine) return;
-      if (typeof ev.data === "string" && /"type":"(status|welcome)"/.test(ev.data) && !JSON.parse(ev.data).connected) cancelConfirm();
+      if (typeof ev.data === "string" && /"type":"(status|welcome)"/.test(ev.data) && !JSON.parse(ev.data).connected) {
+        cancelConfirm();
+        void haltListening();
+      }
       inbox = inbox.then(() => { if (ws === mine) return onMessage(ev); });
     };
     // Stay linked through network drops: redial this socket's URL until a newer connect() replaces it.
