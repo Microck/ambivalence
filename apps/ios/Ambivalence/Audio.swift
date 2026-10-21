@@ -141,6 +141,38 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
         try await readChunk(owner: owner, id: id, chunkMs: min(30000, max(100, maxMs)))
     }
 
+    /// Number of whole 16-bit mono PCM bytes corresponding to [chunkMs] at [rate] Hz.
+    static func chunkByteCount(chunkMs: Int, rate: Int) -> UInt64 {
+        (UInt64(chunkMs) * UInt64(rate) * 2 / 1000) & ~1
+    }
+
+    /// Reads up to [want] bytes of whole 16-bit samples from [url] starting at [readOffset],
+    /// aligning both [readOffset] (relative to [origin]) and the returned byte count to 2-byte
+    /// sample boundaries so odd byte counts (such as 100 ms at 11,025 Hz = 2,205 bytes) never
+    /// split a sample across chunks.
+    static func readAlignedPCM(from url: URL, origin: UInt64, readOffset: inout UInt64, want: UInt64) throws -> (pcm: Data, size: UInt64) {
+        if readOffset < origin {
+            readOffset = origin
+        } else if (readOffset - origin) % 2 != 0 {
+            readOffset -= 1
+        }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let size = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
+        let available = (size > readOffset ? size - readOffset : 0) & ~1
+        let n = Int(min(want & ~1, available)) & ~1
+        var pcm = Data()
+        if n > 0 {
+            let fh = try FileHandle(forReadingFrom: url)
+            defer { try? fh.close() }
+            try fh.seek(toOffset: readOffset)
+            let raw = try fh.read(upToCount: n) ?? Data()
+            let aligned = raw.count & ~1
+            pcm = aligned == raw.count ? raw : Data(raw.prefix(aligned))
+            readOffset += UInt64(pcm.count)
+        }
+        return (pcm, size)
+    }
+
     // chunkMs may exceed the protocol chunk cap for a one-shot clip: there the whole clip is
     // wanted in one reply, and the recorder stops on its own at that length.
     private func readChunk(owner: String, id: String, chunkMs: Int) async throws -> (meta: [String: Any], wav: Data) {
@@ -150,7 +182,7 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
         while true {
             let s = try state(owner: owner, id: id)
             if s.autoStopped { audioFinished(gen: s.gen) }
-            want = UInt64(chunkMs) * UInt64(s.rate) * 2 / 1000
+            want = Self.chunkByteCount(chunkMs: chunkMs, rate: s.rate)
             if s.available >= want || s.ended || Date() >= deadline { break }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
@@ -170,18 +202,7 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
                 throw LinkError("no such audio session")
             }
             let origin = pcmOrigin(url)
-            if readOffset < origin { readOffset = origin }
-            let size = fileSize(url)
-            let available = size > readOffset ? size - readOffset : 0
-            let n = Int(min(want, available))
-            var pcm = Data()
-            if n > 0 {
-                let fh = try FileHandle(forReadingFrom: url)
-                defer { try? fh.close() }
-                try fh.seek(toOffset: readOffset)
-                pcm = try fh.read(upToCount: n) ?? Data()
-                readOffset += UInt64(pcm.count)
-            }
+            let (pcm, size) = try Self.readAlignedPCM(from: url, origin: origin, readOffset: &readOffset, want: want)
             // The recorder may stop between the last state() poll and this drain; report it so
             // the indicator never outlives the microphone.
             if !r.isRecording && !stopNotified {
@@ -189,8 +210,8 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
                 autoStopped = true
                 gen = sessionGen
             }
-            let ended = !r.isRecording && readOffset >= size
-            let dataBytes = size > origin ? size - origin : 0
+            let ended = !r.isRecording && (size <= readOffset || size - readOffset < 2)
+            let dataBytes = (size > origin ? size - origin : 0) & ~1
             let total = Int(dataBytes * 1000 / UInt64(rate * 2))
             let meta: [String: Any] = [
                 "mime": "audio/wav", "bytes": 44 + pcm.count,
@@ -266,7 +287,7 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
     private func detachLocked(_ r: AVAudioRecorder) -> (meta: [String: Any], url: URL?, gen: Int) {
         let origin = file.map(pcmOrigin) ?? 44
         let size = fileSize(file)
-        let dataBytes = size > origin ? size - origin : 0
+        let dataBytes = (size > origin ? size - origin : 0) & ~1
         let total = Int(dataBytes * 1000 / UInt64(rate * 2))
         let gen = sessionGen
         stopNotified = true
@@ -337,9 +358,13 @@ final class Audio: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
             throw LinkError("no such audio session")
         }
         let origin = pcmOrigin(url)
-        if readOffset < origin { readOffset = origin }
+        if readOffset < origin {
+            readOffset = origin
+        } else if (readOffset - origin) % 2 != 0 {
+            readOffset -= 1
+        }
         let size = fileSize(url)
-        let available = size > readOffset ? size - readOffset : 0
+        let available = (size > readOffset ? size - readOffset : 0) & ~1
         var autoStopped = false
         if !r.isRecording && !stopNotified {
             stopNotified = true

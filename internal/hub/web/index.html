@@ -310,6 +310,9 @@
   // that has not read for a minute is not listening: end the session, let it drain what is
   // buffered, and start another. 60 s of Float32 at 48 kHz is about 11 MB.
   const MAX_UNREAD_MS = 60000;
+  // Tracks acquired microphone/context resources while AudioContext.resume() is pending so
+  // haltListening() can close them immediately if the socket drops or the agent departs.
+  let startingListen = null;
 
   // A SCRIPTPROCESSOR still works on every mobile browser; AudioWorklet would add a module
   // loading step for no benefit at 16 kHz. Frames stay Float32 until a read resamples them.
@@ -319,54 +322,63 @@
     // or departure calls haltListening() while the previous AudioContext.close() or the new
     // getUserMedia() is awaiting completion, or if a departure is already queued in inbox ahead
     // of us, abort before opening the mic.
+    const prevPending = startingListen;
+    startingListen = null;
     const prev = listen;
     listen = null;
     const gen = ++listenGen;
     const gone = () => gen !== listenGen || (typeof departuresSeen === "number" && departuresSeen > departuresHandled);
     if (gone()) throw new Error("audio session cancelled");
+    if (prevPending) {
+      await haltMic(prevPending);
+      if (gone()) throw new Error("audio session cancelled");
+    }
     if (prev) {
       showRec(false);
       await haltMic(prev);
       if (gone()) throw new Error("audio session cancelled");
     }
     const mic = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
-    if (gone()) {
-      mic.getTracks().forEach(t => t.stop());
-      throw new Error("audio session cancelled");
+    const pending = { mic, ctx: null, source: null, proc: null, sink: null, halted: false, ended: false };
+    startingListen = pending;
+    try {
+      if (gone()) throw new Error("audio session cancelled");
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      const ctx = new Ctx();
+      pending.ctx = ctx;
+      try { await ctx.resume(); } catch {}
+      if (gone() || pending.halted) throw new Error("audio session cancelled");
+      const source = ctx.createMediaStreamSource(mic);
+      const proc = ctx.createScriptProcessor(4096, 1, 1);
+      const sink = ctx.createGain();
+      sink.gain.value = 0; // keep the graph alive without playing the mic back
+      const s = { id: toHex(rand(8)), mic, ctx, source, proc, sink, rate: ctx.sampleRate,
+        chunks: [], frames: 0, read: 0, maxMs: maxDurationMs || 0, ended: false, halted: false,
+        maxUnread: Math.round(ctx.sampleRate * MAX_UNREAD_MS / 1000) };
+      proc.onaudioprocess = (ev) => {
+        if (s.ended) return;
+        const input = ev.inputBuffer.getChannelData(0);
+        s.chunks.push(new Float32Array(input));
+        s.frames += input.length;
+        if (s.maxMs > 0 && s.frames >= s.rate * s.maxMs / 1000) {
+          s.ended = true;
+          setTimeout(() => haltMic(s), 0);
+        } else if (s.frames - s.read > s.maxUnread) {
+          // Nobody is draining the queue: stop recording instead of growing the heap forever.
+          s.ended = true;
+          setTimeout(() => haltMic(s), 0);
+        }
+      };
+      source.connect(proc); proc.connect(sink); sink.connect(ctx.destination);
+      if (startingListen === pending) startingListen = null;
+      listen = s;
+      showRec(true);
+      return s;
+    } catch (e) {
+      if (startingListen === pending) startingListen = null;
+      await haltMic(pending);
+      throw e;
     }
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    const ctx = new Ctx();
-    try { await ctx.resume(); } catch {}
-    if (gone()) {
-      mic.getTracks().forEach(t => t.stop());
-      try { await ctx.close(); } catch {}
-      throw new Error("audio session cancelled");
-    }
-    const source = ctx.createMediaStreamSource(mic);
-    const proc = ctx.createScriptProcessor(4096, 1, 1);
-    const sink = ctx.createGain();
-    sink.gain.value = 0; // keep the graph alive without playing the mic back
-    const s = { id: toHex(rand(8)), mic, ctx, source, proc, sink, rate: ctx.sampleRate,
-      chunks: [], frames: 0, read: 0, maxMs: maxDurationMs || 0, ended: false, halted: false,
-      maxUnread: Math.round(ctx.sampleRate * MAX_UNREAD_MS / 1000) };
-    proc.onaudioprocess = (ev) => {
-      if (s.ended) return;
-      const input = ev.inputBuffer.getChannelData(0);
-      s.chunks.push(new Float32Array(input));
-      s.frames += input.length;
-      if (s.maxMs > 0 && s.frames >= s.rate * s.maxMs / 1000) {
-        s.ended = true;
-        setTimeout(() => haltMic(s), 0);
-      } else if (s.frames - s.read > s.maxUnread) {
-        // Nobody is draining the queue: stop recording instead of growing the heap forever.
-        s.ended = true;
-        setTimeout(() => haltMic(s), 0);
-      }
-    };
-    source.connect(proc); proc.connect(sink); sink.connect(ctx.destination);
-    listen = s;
-    showRec(true);
-    return s;
   }
 
   // Stops the hardware but keeps captured chunks readable, so audio_read can drain the tail
@@ -375,18 +387,21 @@
     if (!s || s.halted) return;
     s.halted = true;
     s.ended = true; // wake any audio_read waiting for a full chunk
-    try { s.proc.disconnect(); } catch {}
-    try { s.source.disconnect(); } catch {}
-    try { s.sink.disconnect(); } catch {}
-    s.mic.getTracks().forEach(t => t.stop());
-    try { await s.ctx.close(); } catch {}
+    try { s.proc?.disconnect(); } catch {}
+    try { s.source?.disconnect(); } catch {}
+    try { s.sink?.disconnect(); } catch {}
+    s.mic?.getTracks().forEach(t => t.stop());
+    try { await s.ctx?.close(); } catch {}
     if (listen === s) showRec(false);
   }
 
   async function haltListening() {
     listenGen++;
+    const p = startingListen;
+    startingListen = null;
     const s = listen;
     listen = null;
+    if (p) await haltMic(p);
     if (s) {
       showRec(false);
       await haltMic(s);

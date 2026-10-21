@@ -360,7 +360,7 @@ test('in-flight auth finishing after ws.onclose does not restore a seal or let q
     $: () => rec,
     toHex: (u) => Buffer.from(u).toString('hex'),
     fromHex: (s) => new Uint8Array(Buffer.from(s || '', 'hex')),
-     same: () => true,
+    same: () => true,
     MAC: async () => new Uint8Array(32),
     rand: () => new Uint8Array(16),
     unb64: () => new Uint8Array(24),
@@ -396,4 +396,35 @@ test('in-flight auth finishing after ws.onclose does not restore a seal or let q
   await new Promise(r => setImmediate(r));
   assert.equal(vm.runInContext('seal', context), null);
   assert.equal(opened, 0);
+});
+
+test('disconnect while AudioContext.resume is pending immediately stops microphone tracks and closes context', async () => {
+  let resolveResume, stopped = 0, closed = 0;
+  const track = { stop() { stopped++; } };
+  const mic = { getTracks() { return [track]; } };
+  const rec = { hidden: true };
+  class FakeAudioContext {
+    constructor() { this.sampleRate = 16000; }
+    resume() { return new Promise(r => { resolveResume = r; }); }
+    close() { closed++; return Promise.resolve(); }
+  }
+  const context = vm.createContext({
+    $: () => rec,
+    toHex: () => 'deadbeef',
+    rand: () => new Uint8Array(8),
+    navigator: { mediaDevices: { getUserMedia: async () => mic } },
+    window: { isSecureContext: true, AudioContext: FakeAudioContext },
+  });
+  vm.runInContext('let listen = null, listenGen = 0;\n' + html.slice(html.indexOf('  const showRec ='), html.indexOf('  function captureJpeg')), context);
+  const startPromise = context.startListening(10000);
+  await new Promise(r => setImmediate(r));
+  // AudioContext.resume() is still pending when disconnect/departure calls haltListening().
+  await context.haltListening();
+  assert.equal(stopped, 1, 'microphone tracks must be stopped even while resume() is pending');
+  assert.equal(closed, 1, 'AudioContext must be closed even while resume() is pending');
+  assert.equal(vm.runInContext('listen', context), null);
+  resolveResume();
+  await assert.rejects(startPromise, /audio session cancelled/);
+  assert.equal(stopped, 1);
+  assert.equal(rec.hidden, true);
 });

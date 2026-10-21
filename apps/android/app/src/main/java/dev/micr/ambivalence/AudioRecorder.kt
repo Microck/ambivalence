@@ -27,11 +27,13 @@ class AudioRecorder(private val dir: File) {
     /** Called on a recording thread; the UI marshals it to the main thread. */
     var onRecording: ((Boolean) -> Unit)? = null
 
+    private val lifecycleLock = Any()
     private val lock = Any()
     private var session: Session? = null
+    private var sessionGen = 0L
     private val stopCounts = HashMap<String, Int>()
 
-    private class Session(val id: String, val owner: String, val file: File, val rate: Int, val maxBytes: Long) {
+    private class Session(val id: String, val owner: String, val file: File, val rate: Int, val maxBytes: Long, val gen: Long) {
         @Volatile var written = 0L
         @Volatile var readOffset = 0L
         @Volatile var ended = false
@@ -39,78 +41,99 @@ class AudioRecorder(private val dir: File) {
         @Volatile var error: String? = null
         @Volatile var record: AudioRecord? = null
         @Volatile var thread: Thread? = null
+        var stopNotified = false
         var readers = 0
         var deletePending = false
     }
 
     fun stopToken(owner: String): Int = synchronized(lock) { stopCounts[owner] ?: 0 }
 
+    internal fun beginSessionGenerationForTest(): Long = synchronized(lock) {
+        val gen = ++sessionGen
+        onRecording?.invoke(true)
+        gen
+    }
+
+    internal fun finishSessionGenerationForTest(gen: Long) = synchronized(lock) {
+        if (sessionGen == gen) {
+            onRecording?.invoke(false)
+        }
+    }
+
     fun start(owner: String, maxDurationMs: Int, sampleRate: Int, cancelled: () -> Boolean = { false }): JSONObject {
         val token = stopToken(owner)
         if (cancelled()) throw IllegalStateException("audio session cancelled")
-        stopLocked() // finishes the old session before taking the lock for the new one
-        synchronized(lock) {
-            if (cancelled() || (stopCounts[owner] ?: 0) != token) {
-                throw IllegalStateException("audio session cancelled")
-            }
-            val rate = sampleRate.coerceIn(8000, 48000)
-            val id = Link.hex(Link.nonce()).take(16)
-            val file = File.createTempFile("audio-", ".pcm", dir)
-            val min = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            if (min <= 0) {
-                file.delete()
-                throw IllegalStateException("this device cannot record at $rate Hz")
-            }
-            val rec = AudioRecord(
-                MediaRecorder.AudioSource.MIC, rate, AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT, max(min * 2, rate),
-            )
-            if (rec.state != AudioRecord.STATE_INITIALIZED) {
-                rec.release()
-                file.delete()
-                throw IllegalStateException("microphone unavailable")
-            }
-            val s = Session(id, owner, file, rate, max(0, maxDurationMs).toLong() * rate * 2 / 1000)
-            s.record = rec
-            val out = FileOutputStream(file)
-            rec.startRecording()
-            if (cancelled() || (stopCounts[owner] ?: 0) != token) {
-                runCatching { out.close() }
-                runCatching { rec.stop() }
-                rec.release()
-                file.delete()
-                throw IllegalStateException("audio session cancelled")
-            }
-            s.thread = Thread {
-                val buf = ShortArray(max(1024, min / 2))
-                try {
-                    out.use {
-                        while (!s.stopping && !s.ended) {
-                            val n = rec.read(buf, 0, buf.size)
-                            if (n < 0) break
-                            if (n == 0) continue
-                            val bytes = ByteArray(n * 2)
-                            ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(buf, 0, n)
-                            synchronized(lock) {
-                                it.write(bytes)
-                                s.written += bytes.size
-                                // A zero limit means "until audio_stop".
-                                if (s.maxBytes > 0 && s.written >= s.maxBytes) s.ended = true
+        synchronized(lifecycleLock) {
+            stopLocked() // finishes the old session before taking the lock for the new one
+            synchronized(lock) {
+                if (cancelled() || (stopCounts[owner] ?: 0) != token) {
+                    throw IllegalStateException("audio session cancelled")
+                }
+                val rate = sampleRate.coerceIn(8000, 48000)
+                val id = Link.hex(Link.nonce()).take(16)
+                val file = File.createTempFile("audio-", ".pcm", dir)
+                val min = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                if (min <= 0) {
+                    file.delete()
+                    throw IllegalStateException("this device cannot record at $rate Hz")
+                }
+                val rec = AudioRecord(
+                    MediaRecorder.AudioSource.MIC, rate, AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT, max(min * 2, rate),
+                )
+                if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                    rec.release()
+                    file.delete()
+                    throw IllegalStateException("microphone unavailable")
+                }
+                val out = FileOutputStream(file)
+                rec.startRecording()
+                if (cancelled() || (stopCounts[owner] ?: 0) != token) {
+                    runCatching { out.close() }
+                    runCatching { rec.stop() }
+                    rec.release()
+                    file.delete()
+                    throw IllegalStateException("audio session cancelled")
+                }
+                val gen = ++sessionGen
+                val s = Session(id, owner, file, rate, (max(0, maxDurationMs).toLong() * rate * 2 / 1000) and -2L, gen)
+                s.record = rec
+                session = s
+                onRecording?.invoke(true)
+                s.thread = Thread {
+                    val buf = ShortArray(max(1024, min / 2))
+                    try {
+                        out.use {
+                            while (!s.stopping && !s.ended) {
+                                val n = rec.read(buf, 0, buf.size)
+                                if (n < 0) break
+                                if (n == 0) continue
+                                val bytes = ByteArray(n * 2)
+                                ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(buf, 0, n)
+                                synchronized(lock) {
+                                    it.write(bytes)
+                                    s.written += bytes.size
+                                    // A zero limit means "until audio_stop".
+                                    if (s.maxBytes > 0 && s.written >= s.maxBytes) s.ended = true
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        s.error = e.message ?: e.toString()
+                    } finally {
+                        runCatching { rec.stop() }
+                        rec.release()
+                        synchronized(lock) {
+                            s.ended = true
+                            if (sessionGen == s.gen && !s.stopNotified) {
+                                s.stopNotified = true
+                                onRecording?.invoke(false)
                             }
                         }
                     }
-                } catch (e: Exception) {
-                    s.error = e.message ?: e.toString()
-                } finally {
-                    runCatching { rec.stop() }
-                    rec.release()
-                    s.ended = true
-                    onRecording?.invoke(false)
-                }
-            }.also { it.isDaemon = true; it.start() }
-            session = s
-            onRecording?.invoke(true)
-            return JSONObject().put("listenId", id).put("sampleRate", rate).put("maxDurationMs", maxDurationMs)
+                }.also { it.isDaemon = true; it.start() }
+                return JSONObject().put("listenId", id).put("sampleRate", rate).put("maxDurationMs", maxDurationMs)
+            }
         }
     }
 
@@ -127,7 +150,7 @@ class AudioRecorder(private val dir: File) {
             cur
         }
         try {
-            val want = chunkMs.toLong() * s.rate * 2 / 1000
+            val want = (chunkMs.toLong() * s.rate * 2 / 1000) and -2L
             val deadline = System.currentTimeMillis() + chunkMs + 5000
             while (true) {
                 val ready = synchronized(lock) { s.written - s.readOffset >= want || s.ended || cancelled() }
@@ -203,11 +226,7 @@ class AudioRecorder(private val dir: File) {
             }
             val cur = session ?: throw IllegalStateException("no such audio session")
             if (cur.owner != owner || (id != null && cur.id != id)) throw IllegalStateException("no such audio session")
-            session = null
-            cur.stopping = true
-            cur.ended = true
-            runCatching { cur.record?.stop() }
-            cur
+            detachLocked(cur)
         }
         finish(s)
         val totalMs = (s.written * 1000 / (s.rate * 2)).toInt()
@@ -218,32 +237,40 @@ class AudioRecorder(private val dir: File) {
     fun stopAny(): JSONObject {
         val s = synchronized(lock) {
             val cur = session ?: throw IllegalStateException("no such audio session")
-            session = null
-            cur.stopping = true
-            cur.ended = true
-            runCatching { cur.record?.stop() }
-            cur
+            detachLocked(cur)
         }
         finish(s)
         val totalMs = (s.written * 1000 / (s.rate * 2)).toInt()
         return JSONObject().put("durationMs", totalMs).put("totalMs", totalMs).put("ended", true)
     }
 
-    // Detaches and finishes the current session. Called by start() before it takes the lock for
-    // a new session, so the old AudioRecord is fully released first.
+    // Detaches and finishes the current session. Caller holds [lifecycleLock], so the old
+    // AudioRecord is fully released before a new session can start.
     private fun stopLocked() {
         val s = synchronized(lock) {
             val cur = session ?: return
-            session = null
-            cur.stopping = true
-            cur.ended = true
-            runCatching { cur.record?.stop() }
-            cur
+            detachLocked(cur)
         }
-        finish(s)
+        finishLocked(s)
     }
 
-    private fun finish(s: Session) {
+    private fun detachLocked(cur: Session): Session {
+        session = null
+        cur.stopping = true
+        cur.ended = true
+        if (sessionGen == cur.gen && !cur.stopNotified) {
+            cur.stopNotified = true
+            onRecording?.invoke(false)
+        }
+        runCatching { cur.record?.stop() }
+        return cur
+    }
+
+    private fun finish(s: Session) = synchronized(lifecycleLock) {
+        finishLocked(s)
+    }
+
+    private fun finishLocked(s: Session) {
         runCatching { s.thread?.join(2000) }
         runCatching { s.record?.release() }
         synchronized(lock) {

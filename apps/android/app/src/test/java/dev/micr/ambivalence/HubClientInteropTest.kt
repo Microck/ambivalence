@@ -28,6 +28,29 @@ class HubClientInteropTest {
     private val bin = System.getenv("AMBIVALENCE_BIN")
     private val jpeg = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 1, 2, 3, 4, 0xFF.toByte(), 0xD9.toByte())
 
+    @Test fun staleSessionCleanupDoesNotHideNewerRecordingIndicator() {
+        val dir = Files.createTempDirectory("ambivalence-audio-test").toFile()
+        try {
+            val recorder = AudioRecorder(dir)
+            val events = mutableListOf<Boolean>()
+            recorder.onRecording = { events.add(it) }
+
+            val oldGen = recorder.beginSessionGenerationForTest()
+            val newGen = recorder.beginSessionGenerationForTest()
+            assertEquals(listOf(true, true), events)
+
+            // Old worker finishing after newGen started must not emit false.
+            recorder.finishSessionGenerationForTest(oldGen)
+            assertEquals(listOf(true, true), events)
+
+            // Current worker finishing emits false.
+            recorder.finishSessionGenerationForTest(newGen)
+            assertEquals(listOf(true, true, false), events)
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
     @Test fun queuedListenAfterDepartureDoesNotOpenMicrophone() {
         val identity = Identity(MemoryPrefs())
         val key = ByteArray(32) { (it + 1).toByte() }
