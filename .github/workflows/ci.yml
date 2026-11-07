@@ -5,10 +5,11 @@ on:
     branches: [main]
   pull_request:
 
-# Only superseded PR validation is cancelled. Every main push keeps its own run.
+# Only superseded first-attempt PR validation is cancelled.
+# Manual re-runs and main pushes are isolated so they cannot cancel the latest PR run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.run_attempt == 1 && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
 
 permissions:
   contents: read
