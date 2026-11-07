@@ -299,6 +299,10 @@ ambivalence version
 | `AMBIVALENCE_LISTEN` | address the hub listens on, default `0.0.0.0:7842` |
 | `AMBIVALENCE_PUBLIC_HUB` | public `wss://` url that `camera_status` reports to the agent |
 
+## CI validation
+
+The latest revision of each pull request runs the full Go, browser, Android and iOS checks. A newer revision cancels older runs of those checks for the same pull request. Every push to `main` keeps its own validation run. The separate release-binary verification workflow is unchanged.
+
 ## build from source
 
 ```bash
