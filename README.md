@@ -301,7 +301,7 @@ ambivalence version
 
 ## CI validation
 
-The latest revision of each pull request runs the full Go, browser, Android and iOS checks. A newer revision cancels older runs of those checks for the same pull request. Every push to `main` keeps its own validation run. The separate release-binary verification workflow is unchanged.
+The latest revision of each pull request runs the full Go, browser, Android and iOS checks. A newer revision cancels older first-attempt runs of those checks for the same pull request. Manual re-runs are isolated so re-running an older revision cannot cancel current validation; later pushes do not automatically cancel those re-runs. Every push to `main` keeps its own validation run. The separate release-binary verification workflow is unchanged.
 
 ## build from source
 
